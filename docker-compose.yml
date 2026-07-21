@@ -1,0 +1,64 @@
+services:
+  fastapi-router:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    image: local/ollama-openai-router:0.1.0
+    container_name: ollama-openai-router
+    restart: unless-stopped
+    environment:
+      ROUTER_HOST: ${ROUTER_BIND_IP}
+      ROUTER_PORT: 4000
+      OLLAMA_BASE_URL: ${OLLAMA_HOST}
+      MODEL_POLICY_FILE: /app/model_policy.yml
+      KEEP_ALIVE_DEFAULT: ${KEEP_ALIVE_DEFAULT:--1}
+      AUTO_PULL_MISSING_MODELS: ${AUTO_PULL_MISSING_MODELS:-false}
+      MODEL_PULL_TIMEOUT_SEC: ${MODEL_PULL_TIMEOUT_SEC:-7200}
+      MODEL_PULL_MAX_RETRIES: ${MODEL_PULL_MAX_RETRIES:-2}
+      MODEL_PULL_BACKOFF_SEC: ${MODEL_PULL_BACKOFF_SEC:-5}
+      ENABLE_QDRANT_RETRIEVAL: ${ENABLE_QDRANT_RETRIEVAL:-false}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-repo_chunks}
+      QDRANT_EMBEDDING_MODEL: ${QDRANT_EMBEDDING_MODEL:-qwen3-embedding:4b}
+      QDRANT_TOP_K: ${QDRANT_TOP_K:-20}
+      QDRANT_FINAL_K: ${QDRANT_FINAL_K:-8}
+      HEADROOM_ENABLED: ${HEADROOM_ENABLED:-1}
+      EMBEDDING_MODEL_DEFAULT: ${EMBEDDING_MODEL_DEFAULT:-qwen3-embedding:4b}
+    volumes:
+      - ./profiles/${PROFILE:-orin}/models.yaml:/app/model_policy.yml:ro
+    ports:
+      - "${ROUTER_BIND_IP:-0.0.0.0}:${ROUTER_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/healthz', timeout=3)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: qdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__TELEMETRY_DISABLED: ${QDRANT_TELEMETRY_DISABLED:-true}
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    ports:
+      - "${ROUTER_BIND_IP:-0.0.0.0}:${QDRANT_PORT:-6333}:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:6333/readyz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          
+volumes:
+  qdrant-storage:

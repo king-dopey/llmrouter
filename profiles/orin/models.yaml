@@ -1,0 +1,95 @@
+models:
+  - model: qwen3-coder:30b
+    keep_alive: -1
+    think: false
+    warmup: true
+    options:
+      num_ctx: 65536
+      num_batch: 512
+      temperature: 0.1
+      top_p: 0.9
+      repeat_penalty: 1.05
+
+  - model: qwen3.6:35b-a3b
+    keep_alive: 10m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 32768
+      num_batch: 512
+      temperature: 0.6
+      top_p: 0.95
+
+  - model: qwen3:4b
+    keep_alive: 10m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 65536
+      num_batch: 512
+      temperature: 0.2
+      top_p: 0.9
+      repeat_penalty: 1.05
+
+  - model: qwen3-vl:4b
+    keep_alive: 10m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 65536
+      num_batch: 256
+      temperature: 0.2
+      top_p: 0.9
+      repeat_penalty: 1.05
+
+  - model: gemma4:12b
+    keep_alive: 10m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 65536
+      num_batch: 256
+      temperature: 0.3
+      top_p: 0.95
+      repeat_penalty: 1.05
+
+  - model: qwen3-embedding:4b
+    keep_alive: 5m
+    think: false
+    warmup: false
+    options:
+      num_ctx: 8192
+      num_batch: 256
+
+  - model: nemotron-cascade-2:30b-a3b-q4_K_M
+    keep_alive: 10m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 65536
+      num_batch: 256
+      temperature: 0.15
+      top_p: 0.90
+      repeat_penalty: 1.03
+
+  - model: gpt-oss:20b
+    keep_alive: 10m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 65536
+      num_batch: 256
+      temperature: 0.20
+      top_p: 0.95
+      repeat_penalty: 1.03
+
+  - model: laguna-xs-2.1:q4_K_M
+    keep_alive: 10m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 65536
+      num_batch: 256
+      temperature: 0.10
+      top_p: 0.90
+      repeat_penalty: 1.03
