@@ -8,7 +8,7 @@ from unittest import mock
 
 
 ROUTER_DIR = Path(__file__).resolve().parents[1]
-os.environ["MODEL_POLICY_FILE"] = str(ROUTER_DIR / "model_policy.yml")
+os.environ["MODEL_POLICY_FILE"] = str(ROUTER_DIR / "profiles" / "thor" / "models.yaml")
 sys.path.insert(0, str(ROUTER_DIR))
 
 
@@ -102,8 +102,10 @@ class _HeadroomResult:
         self.trimmed = trimmed
         self.messages = messages
         self.prompt_tokens = 0
-        self.usable_prompt_budget = 0
-        self.trim_reason = None
+        self.tokens_before = 0
+        self.tokens_after = 0
+        self.transforms_applied = []
+        self.ccr_hashes = {}
         self.error_response = None
 
 
@@ -238,53 +240,49 @@ class ChatCompletionIntegrationTests(unittest.TestCase):
         self.assertEqual(response.content["usage"]["cache_creation_input_tokens"], 1)
         self.assertEqual(response.content["usage"]["cache_read_input_tokens"], 2)
 
-    def test_nonstream_resolves_headroom_retrieve_transparently(self):
+    def test_nonstream_preserves_full_payload_around_compression(self):
         body = {
             "model": "qwen3:4b",
             "stream": False,
             "messages": [{"role": "user", "content": "continue"}],
+            "temperature": 0.4,
+            "max_tokens": 33,
+            "keep_alive": "30m",
+            "format": {"type": "object"},
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "tool_choice": "auto",
         }
-        first = _FakeHTTPResponse(
-            {
-                "message": {
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "call_hr",
-                            "type": "function",
-                            "function": {"name": "headroom_retrieve", "arguments": {"hash": "abc123"}},
-                        }
-                    ],
-                }
-            }
-        )
-        second = {
-            "message": {"content": "resolved answer"},
-            "prompt_eval_count": 10,
-            "eval_count": 4,
-        }
-        calls = {"n": 0}
+        captured_payload: dict = {}
 
         async def _fake_ollama_post(path: str, payload: dict, stream: bool = False):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return first
-            return _FakeHTTPResponse(second)
+            captured_payload.update(payload)
+            return _FakeHTTPResponse({"message": {"content": "ok"}})
 
+        compressed = [{"role": "user", "content": "compressed"}]
         with (
             mock.patch.object(app, "_preflight_model", new=mock.AsyncMock(return_value=True)),
-            mock.patch.object(app, "check_and_trim", return_value=_HeadroomResult(rejected=False, trimmed=False, messages=body["messages"])),
+            mock.patch.object(
+                app,
+                "check_and_trim",
+                return_value=_HeadroomResult(rejected=False, trimmed=True, messages=compressed),
+            ) as headroom_call,
             mock.patch.object(app, "_ollama_post", new=_fake_ollama_post),
-            mock.patch.object(app, "_continue_after_headroom_retrieve", new=mock.AsyncMock(return_value=second)),
         ):
             response = asyncio.run(app.chat_completions(_FakeRequest(body)))
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.content["choices"][0]["message"]["content"], "resolved answer")
+        self.assertEqual(headroom_call.call_count, 1)
+        self.assertEqual(captured_payload["messages"], compressed)
+        self.assertEqual(captured_payload["keep_alive"], "30m")
+        self.assertEqual(captured_payload["tools"], body["tools"])
+        self.assertEqual(captured_payload["tool_choice"], "auto")
+        self.assertEqual(captured_payload["format"], body["format"])
+        self.assertEqual(captured_payload["options"]["temperature"], 0.4)
+        self.assertEqual(captured_payload["options"]["num_predict"], 33)
 
-    def test_stream_resolves_headroom_retrieve_without_leak(self):
+    def test_stream_forwards_ordinary_tool_calls(self):
         _FakeAsyncClient.stream_lines = [
-            '{"message": {"tool_calls": [{"id": "call_hr", "function": {"name": "headroom_retrieve", "arguments": {"hash": "abc123"}}}]}}',
+            '{"message": {"tool_calls": [{"id": "call_1", "function": {"name": "lookup", "arguments": {"query": "abc"}}}]}}',
             '{"done": true, "done_reason": "stop", "prompt_eval_count": 5, "eval_count": 1}',
         ]
 
@@ -294,24 +292,16 @@ class ChatCompletionIntegrationTests(unittest.TestCase):
             "messages": [{"role": "user", "content": "hello"}],
         }
 
-        continued = {
-            "message": {"content": "resolved stream"},
-            "done_reason": "stop",
-            "prompt_eval_count": 6,
-            "eval_count": 2,
-        }
-
         with (
             mock.patch.object(app, "_preflight_model", new=mock.AsyncMock(return_value=True)),
             mock.patch.object(app, "check_and_trim", return_value=_HeadroomResult(rejected=False, trimmed=False, messages=body["messages"])),
             mock.patch.object(app.httpx, "AsyncClient", _FakeAsyncClient),
-            mock.patch.object(app, "_continue_after_headroom_retrieve", new=mock.AsyncMock(return_value=continued)),
         ):
             response = asyncio.run(app.chat_completions(_FakeRequest(body)))
             frames = asyncio.run(_collect_stream(response.content))
 
-        self.assertTrue(any("resolved stream" in f for f in frames))
-        self.assertFalse(any("headroom_retrieve" in f for f in frames))
+        self.assertTrue(any('"name": "lookup"' in f for f in frames))
+        self.assertTrue(any('"finish_reason": "tool_calls"' in f for f in frames))
 
 
 if __name__ == "__main__":

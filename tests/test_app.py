@@ -5,12 +5,12 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 import logging
 
 logging.getLogger("router").setLevel(logging.WARNING)
 
 ROUTER_DIR = Path(__file__).resolve().parents[1]
-os.environ["MODEL_POLICY_FILE"] = str(ROUTER_DIR / "model_policy.yml")
 sys.path.insert(0, str(ROUTER_DIR))
 
 
@@ -28,8 +28,34 @@ def _install_dependency_stubs() -> None:
                 self.args = args
                 self.kwargs = kwargs
 
+        class HTTPError(Exception):
+            pass
+
+        class HTTPStatusError(HTTPError):
+            def __init__(self, message="", request=None, response=None):
+                super().__init__(message)
+                self.response = response or types.SimpleNamespace(status_code=500)
+                self.request = request
+
+        class ConnectError(HTTPError):
+            pass
+
+        class ConnectTimeout(HTTPError):
+            pass
+
+        class Response:
+            def __init__(self, status_code=200, content=b"", headers=None):
+                self.status_code = status_code
+                self.content = content
+                self.headers = headers or {}
+
         httpx.Timeout = Timeout
         httpx.AsyncClient = AsyncClient
+        httpx.HTTPError = HTTPError
+        httpx.HTTPStatusError = HTTPStatusError
+        httpx.ConnectError = ConnectError
+        httpx.ConnectTimeout = ConnectTimeout
+        httpx.Response = Response
         sys.modules["httpx"] = httpx
 
     if "fastapi" not in sys.modules:
@@ -86,8 +112,6 @@ def _install_dependency_stubs() -> None:
 
 _install_dependency_stubs()
 
-from app import MODEL_POLICY, _build_ollama_payload, _resolve_asr_base_url, v1_audio_align  # noqa: E402
-
 
 def _decorator_paths(module_path: Path, method_name: str) -> set[str]:
     source = module_path.read_text(encoding="utf-8")
@@ -117,8 +141,6 @@ class _FakeRequest:
         return self._payload
 
 
-
-
 class _FakeURL:
     def __init__(self, hostname):
         self.hostname = hostname
@@ -137,7 +159,6 @@ class _FakeEndpointRequest:
 
     async def json(self):
         return self._payload
-
 
 
 class _FakeUpload:
@@ -159,6 +180,7 @@ class _FakeMultipartRequest:
     async def form(self):
         return self._form_payload
 
+
 class _FakeResponse:
     def __init__(self, status_code=200, payload=None, text=""):
         self.status_code = status_code
@@ -170,26 +192,7 @@ class _FakeResponse:
 
 
 class RouterPayloadTests(unittest.TestCase):
-    def test_model_policy_includes_all_served_models(self):
-        coder = MODEL_POLICY["qwen3-coder-next:q4_K_M"]
-        self.assertEqual(coder["keep_alive"], -1)
-        self.assertEqual(coder["think"], False)
-        self.assertEqual(coder["options"]["num_ctx"], 262144)
-        self.assertTrue(coder["warmup"])
-
-        thinker = MODEL_POLICY["qwen3.6:35b-a3b-q8_0"]
-        self.assertEqual(thinker["keep_alive"], -1)
-        self.assertEqual(thinker["think"], True)
-        self.assertEqual(thinker["options"]["num_ctx"], 262144)
-        self.assertEqual(thinker["warmup"], True)
-
-        chat_small = MODEL_POLICY["qwen3:4b"]
-        self.assertEqual(chat_small["keep_alive"], "30m")
-        self.assertEqual(chat_small["think"], True)
-        self.assertEqual(chat_small["options"]["num_ctx"], 65536)
-        self.assertEqual(chat_small["warmup"], False)
-
-
+    """Test app.py functionality."""
 
     def test_router_registers_alignment_routes(self):
         post_paths = _decorator_paths(ROUTER_DIR / "app.py", "post")
@@ -197,8 +200,6 @@ class RouterPayloadTests(unittest.TestCase):
         self.assertIn("/v1/audio/align", post_paths)
         self.assertIn("/v1/audio/transcriptions", post_paths)
         self.assertIn("/v1/embeddings", post_paths)
-
-
 
     def test_resolve_asr_base_url_uses_explicit_override(self):
         import app as app_module
@@ -210,7 +211,7 @@ class RouterPayloadTests(unittest.TestCase):
             app_module.ASR_BASE_URL_ENV = "http://asr-override:18000"
             app_module.ASR_PORT = 8000
             app_module.ASR_SCHEME = "http"
-            resolved = _resolve_asr_base_url(_FakeRequestWithURL("router-host"))
+            resolved = app_module._resolve_asr_base_url(_FakeRequestWithURL("router-host"))
             self.assertEqual("http://asr-override:18000", resolved)
         finally:
             app_module.ASR_BASE_URL_ENV = original_base
@@ -229,7 +230,7 @@ class RouterPayloadTests(unittest.TestCase):
             app_module.ASR_PORT = 18000
             app_module.ASR_SCHEME = "http"
             app_module.OLLAMA_BASE_URL = "http://orin-model-host:11434"
-            resolved = _resolve_asr_base_url(_FakeRequestWithURL("router-host"))
+            resolved = app_module._resolve_asr_base_url(_FakeRequestWithURL("router-host"))
             self.assertEqual("http://orin-model-host:18000", resolved)
         finally:
             app_module.ASR_BASE_URL_ENV = original_base
@@ -254,7 +255,7 @@ class RouterPayloadTests(unittest.TestCase):
 
             with self.assertRaises(Exception) as ctx:
                 asyncio.run(
-                    v1_audio_align(
+                    app_module.v1_audio_align(
                         _FakeEndpointRequest(
                             hostname="router-host",
                             payload={
@@ -276,8 +277,6 @@ class RouterPayloadTests(unittest.TestCase):
         finally:
             app_module._ensure_asr_admission = original_admission
             app_module._asr_post_json = original_asr_post_json
-
-
 
     def test_v1_audio_align_forwards_multipart_upload(self):
         import app as app_module
@@ -315,7 +314,7 @@ class RouterPayloadTests(unittest.TestCase):
                     "return_word_timestamps": "true",
                 },
             )
-            response = asyncio.run(v1_audio_align(req))
+            response = asyncio.run(app_module.v1_audio_align(req))
             self.assertEqual(200, response.status_code)
             self.assertTrue(response.content["forced_alignment_used"])
         finally:
@@ -323,64 +322,361 @@ class RouterPayloadTests(unittest.TestCase):
             app_module._asr_post_multipart = original_asr_post_multipart
 
     def test_build_payload_forwards_unlocked_options_format_and_keep_alive(self):
-        body = {
-            "model": "qwen3-coder-next:q4_K_M",
-            "messages": [{"role": "user", "content": "hi"}],
-            "keep_alive": "5m",
-            "format": "json",
-            "options": {
-                "num_batch": 1024,          # not policy-locked: client should win
-                "repeat_penalty": 1.2,       # not policy-locked: client should win
-            },
-            "temperature": 0.4,
-            "max_tokens": 256,
-        }
-        payload = _build_ollama_payload(body, think=False)
+        """Test with Thor profile model (qwen3-coder-next:q4_K_M)."""
+        from unittest.mock import patch
+        import importlib
+        
+        with patch.dict(os.environ, {"MODEL_POLICY_FILE": str(ROUTER_DIR / "profiles" / "thor" / "models.yaml")}):
+            import app as app_module
+            importlib.reload(app_module)
+            
+            body = {
+                "model": "qwen3-coder-next:q4_K_M",
+                "messages": [{"role": "user", "content": "hi"}],
+                "keep_alive": "5m",
+                "format": "json",
+                "options": {
+                    "num_batch": 1024,          # not policy-locked: client should win
+                    "repeat_penalty": 1.2,       # not policy-locked: client should win
+                },
+                "temperature": 0.4,
+                "max_tokens": 256,
+            }
+            
+            payload = app_module._build_ollama_payload(body, think=False)
 
-        self.assertEqual(payload["keep_alive"], "5m")
-        self.assertEqual(payload["format"], "json")
-        self.assertEqual(payload["options"]["num_batch"], 1024)
-        self.assertEqual(payload["options"]["repeat_penalty"], 1.2)
-        self.assertEqual(payload["options"]["temperature"], 0.4)
-        self.assertEqual(payload["options"]["num_predict"], 256)
-        # Policy default still present because client did not override it.
-        self.assertEqual(payload["options"]["num_ctx"], 262144)
-
+            self.assertEqual(payload["keep_alive"], "5m")
+            self.assertEqual(payload["format"], "json")
+            self.assertEqual(payload["options"]["num_batch"], 1024)
+            self.assertEqual(payload["options"]["repeat_penalty"], 1.2)
+            self.assertEqual(payload["options"]["temperature"], 0.4)
+            self.assertEqual(payload["options"]["num_predict"], 256)
+            # Policy default still present because client did not override it.
+            self.assertEqual(payload["options"]["num_ctx"], 131072)
 
     def test_build_payload_policy_num_ctx_overrides_client(self):
-        body = {
-            "model": "qwen3-coder-next:q4_K_M",
-            "messages": [{"role": "user", "content": "hi"}],
-            "options": {"num_ctx": 16384},
-        }
-        with self.assertLogs("router", level="INFO") as cm:
-            payload = _build_ollama_payload(body, think=False)
-        self.assertEqual(payload["options"]["num_ctx"], 262144)
-        self.assertTrue(any("overriding client num_ctx" in m for m in cm.output))
-
+        """Test with Thor profile model (qwen3-coder-next:q4_K_M)."""
+        from unittest.mock import patch
+        import importlib
+        
+        with patch.dict(os.environ, {"MODEL_POLICY_FILE": str(ROUTER_DIR / "profiles" / "thor" / "models.yaml")}):
+            import app as app_module
+            importlib.reload(app_module)
+            
+            body = {
+                "model": "qwen3-coder-next:q4_K_M",
+                "messages": [{"role": "user", "content": "hi"}],
+                "options": {"num_ctx": 16384},
+            }
+            
+            with self.assertLogs("router", level="INFO") as cm:
+                payload = app_module._build_ollama_payload(body, think=False)
+            self.assertEqual(payload["options"]["num_ctx"], 131072)
+            self.assertTrue(any("overriding client num_ctx" in m for m in cm.output))
 
     def test_build_payload_uses_policy_defaults_when_client_silent(self):
-        body = {
-            "model": "qwen3-coder-next:q4_K_M",
-            "messages": [{"role": "user", "content": "hi"}],
-        }
-        payload = _build_ollama_payload(body, think=False)
-        opts = payload["options"]
-        self.assertEqual(opts["num_ctx"], 262144)
-        self.assertEqual(opts["num_batch"], 512)
-        self.assertEqual(opts["temperature"], 0.15)
-        self.assertEqual(payload["keep_alive"], -1)  # from policy
-
+        """Test with Thor profile model (qwen3-coder-next:q4_K_M)."""
+        from unittest.mock import patch
+        import importlib
+        
+        with patch.dict(os.environ, {"MODEL_POLICY_FILE": str(ROUTER_DIR / "profiles" / "thor" / "models.yaml")}):
+            import app as app_module
+            importlib.reload(app_module)
+            
+            body = {
+                "model": "qwen3-coder-next:q4_K_M",
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            
+            payload = app_module._build_ollama_payload(body, think=False)
+            opts = payload["options"]
+            self.assertEqual(opts["num_ctx"], 131072)
+            self.assertEqual(opts["num_batch"], 256)
+            self.assertEqual(opts["temperature"], 0.12)
+            self.assertEqual(payload["keep_alive"], "45m")  # from policy
 
     def test_build_payload_uses_model_keep_alive_when_request_omits_it(self):
-        body = {
-            "model": "nemotron-cascade-2:30b",
-            "messages": [{"role": "user", "content": "Verify this answer."}],
+        """Test with Orin profile model (nemotron-cascade-2:30b-a3b-q4_K_M)."""
+        from unittest.mock import patch
+        import importlib
+        
+        # Save original state
+        original_policy_file = os.environ.get("MODEL_POLICY_FILE")
+        import app as app_module
+        
+        try:
+            with patch.dict(os.environ, {"MODEL_POLICY_FILE": str(ROUTER_DIR / "profiles" / "orin" / "models.yaml")}):
+                # Reload app module to pick up the new environment variable
+                importlib.reload(app_module)
+                
+                body = {
+                    "model": "nemotron-cascade-2:30b-a3b-q4_K_M",
+                    "messages": [{"role": "user", "content": "Verify this answer."}],
+                }
+                
+                payload = app_module._build_ollama_payload(body, think=True)
+
+                self.assertEqual(payload["keep_alive"], "10m")
+        finally:
+            # Restore original state
+            if original_policy_file is not None:
+                os.environ["MODEL_POLICY_FILE"] = original_policy_file
+            elif "MODEL_POLICY_FILE" in os.environ:
+                del os.environ["MODEL_POLICY_FILE"]
+            # Reload the module to restore original state
+            importlib.reload(app_module)
+
+
+class TestWarmupAutoPull(unittest.IsolatedAsyncioTestCase):
+    """Tests for _warmup_model() auto-pull behavior on 404 responses."""
+
+    def setUp(self):
+        import importlib
+        import app as app_module
+        self.app = app_module
+
+    def _make_entry(self):
+        return {
+            "keep_alive": "-1",
+            "options": {"num_ctx": 65536},
         }
 
-        payload = _build_ollama_payload(body, think=True)
+    async def test_warmup_success_no_pull(self):
+        """Warmup succeeds on first try — no pull triggered."""
+        from unittest.mock import AsyncMock, patch
 
-        self.assertEqual(payload["keep_alive"], "10m")
+        entry = self._make_entry()
+        mock_response = mock.MagicMock()
+        mock_response.status_code = 200
+
+        with (
+            patch.object(self.app, "_send_warmup_request", new=AsyncMock(return_value=mock_response)),
+            patch.object(self.app, "pull_model", new=AsyncMock()) as mock_pull,
+        ):
+            await self.app._warmup_model("test-model", entry)
+            mock_pull.assert_not_called()
+
+    async def test_warmup_404_triggers_pull_when_auto_pull_enabled(self):
+        """404 triggers pull_model when AUTO_PULL_MISSING_MODELS is True."""
+        from unittest.mock import AsyncMock, patch
+        import httpx
+
+        entry = self._make_entry()
+        mock_404_response = unittest.mock.MagicMock(status_code=404)
+        mock_200_response = mock.MagicMock(status_code=200)
+        status_error = httpx.HTTPStatusError(
+            "Not Found",
+            request=mock.MagicMock(),
+            response=mock_404_response,
+        )
+
+        # First call raises 404, second call succeeds
+        send_mock = AsyncMock(side_effect=[status_error, mock_200_response])
+
+        with (
+            patch.object(self.app, "AUTO_PULL_MISSING_MODELS", True),
+            patch.object(self.app, "_send_warmup_request", send_mock),
+            patch.object(self.app, "pull_model", new=AsyncMock(return_value=True)) as mock_pull,
+        ):
+            await self.app._warmup_model("test-model", entry)
+            mock_pull.assert_called_once_with("test-model")
+            self.assertEqual(send_mock.call_count, 2)
+
+    async def test_warmup_404_no_pull_when_auto_pull_disabled(self):
+        """404 does NOT trigger pull when AUTO_PULL_MISSING_MODELS is False."""
+        from unittest.mock import AsyncMock, patch
+        import httpx
+
+        entry = self._make_entry()
+        mock_404_response = mock.MagicMock(status_code=404)
+        status_error = httpx.HTTPStatusError(
+            "Not Found",
+            request=mock.MagicMock(),
+            response=mock_404_response,
+        )
+
+        with (
+            patch.object(self.app, "AUTO_PULL_MISSING_MODELS", False),
+            patch.object(self.app, "_send_warmup_request", new=AsyncMock(side_effect=status_error)),
+            patch.object(self.app, "pull_model", new=AsyncMock()) as mock_pull,
+        ):
+            await self.app._warmup_model("test-model", entry)
+            mock_pull.assert_not_called()
+
+    async def test_warmup_404_pull_fails_logs_warning(self):
+        """404 + pull returns False — warning logged, no crash."""
+        from unittest.mock import AsyncMock, patch
+        import httpx
+
+        entry = self._make_entry()
+        mock_404_response = mock.MagicMock(status_code=404)
+        status_error = httpx.HTTPStatusError(
+            "Not Found",
+            request=mock.MagicMock(),
+            response=mock_404_response,
+        )
+
+        with (
+            patch.object(self.app, "AUTO_PULL_MISSING_MODELS", True),
+            patch.object(self.app, "_send_warmup_request", new=AsyncMock(side_effect=status_error)),
+            patch.object(self.app, "pull_model", new=AsyncMock(return_value=False)) as mock_pull,
+        ):
+            # Should not raise
+            await self.app._warmup_model("test-model", entry)
+            mock_pull.assert_called_once_with("test-model")
+
+    async def test_warmup_404_pull_succeeds_retry_fails(self):
+        """404 + pull succeeds + retry fails — warning logged, no crash."""
+        from unittest.mock import AsyncMock, patch
+        import httpx
+
+        entry = self._make_entry()
+        mock_404_response = mock.MagicMock(status_code=404)
+        status_error_404 = httpx.HTTPStatusError(
+            "Not Found",
+            request=mock.MagicMock(),
+            response=mock_404_response,
+        )
+        generic_error = Exception("retry failed")
+
+        # First call: 404. Second call: generic exception.
+        send_mock = AsyncMock(side_effect=[status_error_404, generic_error])
+
+        with (
+            patch.object(self.app, "AUTO_PULL_MISSING_MODELS", True),
+            patch.object(self.app, "_send_warmup_request", send_mock),
+            patch.object(self.app, "pull_model", new=AsyncMock(return_value=True)) as mock_pull,
+        ):
+            # Should not raise
+            await self.app._warmup_model("test-model", entry)
+            mock_pull.assert_called_once_with("test-model")
+            self.assertEqual(send_mock.call_count, 2)
+
+    async def test_warmup_non_404_no_pull(self):
+        """Non-404 HTTP error does NOT trigger pull."""
+        from unittest.mock import AsyncMock, patch
+        import httpx
+
+        entry = self._make_entry()
+        mock_500_response = mock.MagicMock(status_code=500)
+        status_error = httpx.HTTPStatusError(
+            "Internal Server Error",
+            request=mock.MagicMock(),
+            response=mock_500_response,
+        )
+
+        with (
+            patch.object(self.app, "AUTO_PULL_MISSING_MODELS", True),
+            patch.object(self.app, "_send_warmup_request", new=AsyncMock(side_effect=status_error)),
+            patch.object(self.app, "pull_model", new=AsyncMock()) as mock_pull,
+        ):
+            await self.app._warmup_model("test-model", entry)
+            mock_pull.assert_not_called()
+
+    async def test_warmup_connection_error_no_pull(self):
+        """ConnectError does NOT trigger pull — Ollama host unreachable."""
+        from unittest.mock import AsyncMock, patch
+        import httpx
+
+        entry = self._make_entry()
+
+        with (
+            patch.object(self.app, "AUTO_PULL_MISSING_MODELS", True),
+            patch.object(self.app, "_send_warmup_request", new=AsyncMock(side_effect=httpx.ConnectError("connection refused"))),
+            patch.object(self.app, "pull_model", new=AsyncMock()) as mock_pull,
+        ):
+            await self.app._warmup_model("test-model", entry)
+            mock_pull.assert_not_called()
+
+
+class TestEmbeddingModelDetection(unittest.TestCase):
+    """Tests for _is_embedding_model() detection logic."""
+
+    def setUp(self):
+        import importlib
+        import app as app_module
+        self.app = app_module
+
+    def test_embedding_model_detected_by_name(self):
+        """Models with 'embed' in name are detected as embedding models."""
+        self.assertTrue(self.app._is_embedding_model("qwen3-embedding:8b"))
+        self.assertTrue(self.app._is_embedding_model("nomic-embed-text"))
+        self.assertTrue(self.app._is_embedding_model("EMBEDDING-model"))
+        self.assertTrue(self.app._is_embedding_model("model-embed-v1"))
+
+    def test_chat_model_not_detected_as_embedding(self):
+        """Chat models without 'embed' are not detected as embedding models."""
+        self.assertFalse(self.app._is_embedding_model("qwen3.6:35b-a3b-q8_0"))
+        self.assertFalse(self.app._is_embedding_model("laguna-xs-2.1:q4_K_M"))
+        self.assertFalse(self.app._is_embedding_model("llama3:8b"))
+        self.assertFalse(self.app._is_embedding_model("gpt-4"))
+
+
+class TestWarmupEndpointSelection(unittest.IsolatedAsyncioTestCase):
+    """Tests for _send_warmup_request() endpoint selection based on model type."""
+
+    def setUp(self):
+        import importlib
+        import app as app_module
+        self.app = app_module
+
+    def _make_entry(self):
+        return {
+            "keep_alive": "-1",
+            "options": {"num_ctx": 65536},
+        }
+
+    async def test_embedding_model_uses_embeddings_endpoint(self):
+        """Embedding models use /api/embeddings endpoint."""
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        entry = self._make_entry()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            await self.app._send_warmup_request("qwen3-embedding:8b", entry)
+
+            # Verify /api/embeddings endpoint was called
+            mock_client.post.assert_called_once()
+            call_args = mock_client.post.call_args
+            self.assertIn("/api/embeddings", call_args[0][0])
+            # Verify payload has 'prompt' field for embeddings
+            payload = call_args[1]["json"]
+            self.assertIn("prompt", payload)
+            self.assertEqual(payload["model"], "qwen3-embedding:8b")
+
+    async def test_chat_model_uses_chat_endpoint(self):
+        """Chat models use /api/chat endpoint."""
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        entry = self._make_entry()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            await self.app._send_warmup_request("qwen3.6:35b-a3b-q8_0", entry)
+
+            # Verify /api/chat endpoint was called
+            mock_client.post.assert_called_once()
+            call_args = mock_client.post.call_args
+            self.assertIn("/api/chat", call_args[0][0])
+            # Verify payload has 'messages' field for chat
+            payload = call_args[1]["json"]
+            self.assertIn("messages", payload)
+            self.assertEqual(payload["model"], "qwen3.6:35b-a3b-q8_0")
 
 
 if __name__ == "__main__":

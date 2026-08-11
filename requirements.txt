@@ -1,7 +1,27 @@
-fastapi==0.115.12
-headroom-ai[all]
-httpx==0.28.1
-python-multipart==0.0.9
-PyYAML==6.0.2
+# Core packages
+fastapi
+httpx
+python-multipart
+PyYAML
 qdrant-client
-uvicorn==0.34.2
+uvicorn
+
+# Headroom-ai with explicit ML stack for [relevance]
+headroom-ai[code,relevance]>=0.33.0
+
+# Explicit ML dependencies (required by headroom-ai[relevance])
+# Use --extra-index-url to allow PyTorch CPU wheels while still using PyPI for other packages
+--extra-index-url https://download.pytorch.org/whl/cpu
+# PyTorch 2.5.0+ available on CPU index; older versions not available
+torch>=2.5.0,<3.0.0
+# transformers 4.30.0+ available on PyPI
+transformers>=4.40.0,<5.0.0
+# sentence-transformers 2.2.0+ available on PyPI
+sentence-transformers>=2.7.0
+
+# ONNX Runtime for Kompress fallback
+onnxruntime>=1.16.0
+python-multipart
+PyYAML
+qdrant-client
+uvicorn

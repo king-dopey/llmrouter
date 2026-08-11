@@ -1,25 +1,72 @@
-models:
-  - model: qwen3-coder-next:q4_K_M
-    keep_alive: -1
-    think: false
-    warmup: true
-    options:
-      num_ctx: 262144
-      num_batch: 512
-      temperature: 0.15
-      top_p: 0.95
-      repeat_penalty: 1.05
+# Zoo Code routing guidance
+#
+# Primary mode -> model mapping
+#   architect             -> qwen3.6:35b-a3b-q8_0
+#   code                  -> laguna-xs-2.1:q4_K_M
+#   tester                -> qwen3.6:35b-a3b-q8_0
+#   reviewer              -> qwen3.6:35b-a3b-q8_0
+#   security-review       -> granite4.1-guardian:8b-q6_K
+#   documentation-writer  -> qwen3.6:35b-a3b-q8_0
+#   debug                 -> qwen3.6:35b-a3b-q8_0
+#   planning-prompt       -> qwen3.6:35b-a3b-q8_0
+#
+# Secondary / fallback suggestions
+#   code fast fallback    -> qwen3-coder-next:q4_K_M
+#   long-context alt code -> north-mini-code-1.0:q8_0
+#   alt reasoning         -> gpt-oss:20b
+#   vision compatibility  -> qwen3-vl:4b
+#   small compatibility   -> qwen3:4b
+#   small replacement     -> qwen3.5:4b
+#   embeddings primary    -> qwen3-embedding:8b
+#   embeddings transition -> qwen3-embedding:4b
 
+models:
+  # Default chat / architect / tester / reviewer / debug / docs
   - model: qwen3.6:35b-a3b-q8_0
     keep_alive: -1
     think: true
     warmup: true
     options:
       num_ctx: 262144
-      num_batch: 512
-      temperature: 0.25
+      num_batch: 384
+      temperature: 0.20
       top_p: 0.95
+      repeat_penalty: 1.03
 
+  # Primary Zoo Code implementation model
+  - model: laguna-xs-2.1:q4_K_M
+    keep_alive: -1
+    think: true
+    warmup: true
+    options:
+      num_ctx: 262144
+      num_batch: 384
+      temperature: 0.10
+      top_p: 0.90
+      repeat_penalty: 1.03
+
+  # Primary code-search / indexing model
+  - model: qwen3-embedding:8b
+    keep_alive: -1
+    think: false
+    warmup: true
+    options:
+      num_ctx: 40960
+      num_batch: 512
+
+  # Fast coding fallback; not pinned because of 52GB model size
+  - model: qwen3-coder-next:q4_K_M
+    keep_alive: 45m
+    think: false
+    warmup: false
+    options:
+      num_ctx: 131072
+      num_batch: 256
+      temperature: 0.12
+      top_p: 0.95
+      repeat_penalty: 1.05
+
+  # Strong general fallback
   - model: gemma4:31b-it-q4_K_M
     keep_alive: 20m
     think: true
@@ -31,8 +78,9 @@ models:
       top_p: 0.95
       repeat_penalty: 1.05
 
+  # Legacy coding fallback; retained for optional A/B only
   - model: devstral-small-2:24b-instruct-2512-q8_0
-    keep_alive: 20m
+    keep_alive: 15m
     think: true
     warmup: false
     options:
@@ -42,8 +90,9 @@ models:
       top_p: 0.90
       repeat_penalty: 1.03
 
+  # Very long-context coding alternative
   - model: north-mini-code-1.0:q8_0
-    keep_alive: 20m
+    keep_alive: 15m
     think: true
     warmup: false
     options:
@@ -53,98 +102,105 @@ models:
       top_p: 0.90
       repeat_penalty: 1.03
 
+  # Security gate / judging model
   - model: granite4.1-guardian:8b-q6_K
     keep_alive: 20m
     think: false
     warmup: false
     options:
-      num_ctx: 65536
+      num_ctx: 131072
       num_batch: 256
       temperature: 0.0
       top_p: 0.90
       repeat_penalty: 1.00
 
+  # Compatibility model; keep until dependent services migrate
   - model: qwen3:4b
     keep_alive: 30m
     think: true
     warmup: false
     options:
-      num_ctx: 65536
+      num_ctx: 40960
       num_batch: 512
-      temperature: 0.2
-      top_p: 0.9
-      repeat_penalty: 1.05
-
-  - model: qwen3-vl:4b
-    keep_alive: 30m
-    think: true
-    warmup: false
-    options:
-      num_ctx: 65536
-      num_batch: 256
-      temperature: 0.2
-      top_p: 0.9
-      repeat_penalty: 1.05
-
-  - model: gemma4:12b
-    keep_alive: 30m
-    think: true
-    warmup: false
-    options:
-      num_ctx: 65536
-      num_batch: 256
-      temperature: 0.3
-      top_p: 0.95
-      repeat_penalty: 1.05
-
-  - model: reader-lm:1.5b
-    keep_alive: 30m
-    think: false
-    warmup: false
-    options:
-      num_ctx: 65536
-      num_batch: 256
-      temperature: 0.0
-      top_p: 0.9
-
-  - model: qwen3-embedding:4b
-    keep_alive: 30m
-    think: false
-    warmup: false
-    options:
-      num_ctx: 8192
-      num_batch: 256
-
-  - model: nemotron-cascade-2:30b-a3b-q4_K_M
-    keep_alive: 20m
-    think: true
-    warmup: false
-    options:
-      num_ctx: 131072
-      num_batch: 256
-      temperature: 0.15
+      temperature: 0.20
       top_p: 0.90
-      repeat_penalty: 1.03
+      repeat_penalty: 1.05
 
-  - model: gpt-oss:20b
-    keep_alive: 20m
+  # New small replacement path for qwen3:4b and eventually qwen3-vl:4b
+  - model: qwen3.5:4b
+    keep_alive: 30m
     think: true
     warmup: false
     options:
       num_ctx: 131072
       num_batch: 512
       temperature: 0.20
-      top_p: 0.95
-      repeat_penalty: 1.03
+      top_p: 0.90
+      repeat_penalty: 1.05
 
-  - model: laguna-xs-2.1:q4_K_M
+  # Keep for current vision-dependent callers until they migrate
+  - model: qwen3-vl:4b
+    keep_alive: 30m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 131072
+      num_batch: 256
+      temperature: 0.20
+      top_p: 0.90
+      repeat_penalty: 1.05
+
+  - model: gemma4:12b
     keep_alive: 20m
     think: true
     warmup: false
     options:
       num_ctx: 131072
       num_batch: 256
-      temperature: 0.10
+      temperature: 0.25
+      top_p: 0.95
+      repeat_penalty: 1.05
+
+  # HTML -> Markdown utility
+  - model: reader-lm:1.5b
+    keep_alive: 20m
+    think: false
+    warmup: false
+    options:
+      num_ctx: 131072
+      num_batch: 256
+      temperature: 0.0
+      top_p: 0.90
+
+  # Transition embedding model; keep until all clients move to 8b
+  - model: qwen3-embedding:4b
+    keep_alive: 30m
+    think: false
+    warmup: false
+    options:
+      num_ctx: 40960
+      num_batch: 256
+
+  # Reasoning-heavy alternate
+  - model: nemotron-cascade-2:30b-a3b-q4_K_M
+    keep_alive: 15m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 131072
+      num_batch: 256
+      temperature: 0.15
       top_p: 0.90
       repeat_penalty: 1.03
-  
+
+  # Alternate reasoning / review model
+  - model: gpt-oss:20b
+    keep_alive: 15m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 131072
+      num_batch: 384
+      temperature: 0.20
+      top_p: 0.95
+      repeat_penalty: 1.03

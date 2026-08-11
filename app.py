@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
 
 from policy import load_think_policy_config, parse_think_override, should_enable_think
-from router_headroom import check_and_trim, retrieve_from_ccr
+from router_headroom import check_and_trim
 from retrieval import RetrievedChunk, format_retrieval_context, retrieve_context
 
 # Add lock for preventing concurrent pulls of the same model
@@ -23,6 +23,30 @@ from asyncio import Lock
 
 logger = logging.getLogger("router")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+
+def _safe_error_response(exc: Exception, operation: str) -> dict:
+    """Create a sanitized error response for client consumption.
+    
+    Logs full error details server-side but returns a generic message
+    to clients to prevent information disclosure (CWE-209).
+    
+    Args:
+        exc: The exception that occurred
+        operation: Description of the operation that failed
+        
+    Returns:
+        dict: Sanitized error response structure
+    """
+    error_id = str(uuid.uuid4())[:8]
+    logger.error("[%s] %s: %s: %s", error_id, operation, type(exc).__name__, exc)
+    return {
+        "error": {
+            "message": f"An internal error occurred ({error_id}). Please check server logs.",
+            "type": "internal_error",
+            "code": error_id
+        }
+    }
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
 ASR_BASE_URL_ENV = os.getenv("ASR_BASE_URL", "").rstrip("/")
@@ -38,7 +62,6 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "repo_chunks")
 QDRANT_EMBEDDING_MODEL = os.getenv("QDRANT_EMBEDDING_MODEL", "nomic-embed-text")
 QDRANT_TOP_K = int(os.getenv("QDRANT_TOP_K", "20"))
 QDRANT_FINAL_K = int(os.getenv("QDRANT_FINAL_K", "8"))
-MAX_HEADROOM_RETRIEVE_HOPS = int(os.getenv("HEADROOM_MAX_RETRIEVE_HOPS", "3"))
 
 def _translate_tool_calls(ollama_tool_calls):
     """Convert Ollama-shape tool_calls to OpenAI-shape.
@@ -314,27 +337,107 @@ async def lifespan(app: FastAPI):
     # Nothing to clean up today. If you later add an httpx.AsyncClient or a
     # background task, close/cancel it here.
 
+def _is_embedding_model(model: str) -> bool:
+    """Detect if a model is an embedding model based on name pattern."""
+    return "embed" in model.lower()
+
+
+async def _send_warmup_request(model: str, entry: dict[str, Any]) -> httpx.Response:
+    """Send a minimal warmup request to Ollama and return the response.
+
+    Uses /api/embeddings for embedding models, /api/chat for chat models.
+    Raises httpx.HTTPStatusError on non-2xx responses.
+    """
+    timeout = httpx.Timeout(connect=10.0, read=1200.0, write=30.0, pool=30.0)
+    
+    if _is_embedding_model(model):
+        # Embedding models use /api/embeddings endpoint
+        payload = {
+            "model": model,
+            "prompt": "warmup",
+        }
+        endpoint = f"{OLLAMA_BASE_URL}/api/embeddings"
+        logger.debug("warmup: using embeddings endpoint for %s", model)
+    else:
+        # Chat models use /api/chat endpoint
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ok"}],
+            "stream": False,
+            "keep_alive": entry.get("keep_alive", -1),
+            "think": False,
+            "options": {**(entry.get("options") or {}), "num_predict": 1},
+        }
+        endpoint = f"{OLLAMA_BASE_URL}/api/chat"
+    
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(endpoint, json=payload)
+        r.raise_for_status()
+    return r
+
+
 async def _warmup_model(model: str, entry: dict[str, Any]) -> None:
     """Send a tiny generation so Ollama loads the model at the policy num_ctx
-    and pins it according to keep_alive."""
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "ok"}],
-        "stream": False,
-        "keep_alive": entry.get("keep_alive", -1),
-        "think": False,
-        "options": {**(entry.get("options") or {}), "num_predict": 1},
-    }
+    and pins it according to keep_alive.
+
+    If the model is not found (HTTP 404) and AUTO_PULL_MISSING_MODELS is enabled,
+    the router will attempt to pull the missing model and retry the warmup once.
+    """
     try:
-        timeout = httpx.Timeout(connect=10.0, read=1200.0, write=30.0, pool=30.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-            r.raise_for_status()
+        await _send_warmup_request(model, entry)
         logger.info(
             "warmup: %s loaded at num_ctx=%s keep_alive=%s",
             model,
             (entry.get("options") or {}).get("num_ctx"),
             entry.get("keep_alive"),
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            logger.info(
+                "warmup: model '%s' not found on Ollama host, attempting auto-pull...",
+                model,
+            )
+            if not AUTO_PULL_MISSING_MODELS:
+                logger.info(
+                    "warmup: auto-pull is disabled (AUTO_PULL_MISSING_MODELS=false), "
+                    "skipping pull for '%s'",
+                    model,
+                )
+                return
+
+            pull_result = await pull_model(model)
+            if not pull_result:
+                logger.warning(
+                    "warmup: failed to pull '%s': pull returned false",
+                    model,
+                )
+                return
+
+            logger.info(
+                "warmup: pulled missing model '%s', retrying warmup...",
+                model,
+            )
+            try:
+                await _send_warmup_request(model, entry)
+                logger.info(
+                    "warmup: %s loaded at num_ctx=%s keep_alive=%s",
+                    model,
+                    (entry.get("options") or {}).get("num_ctx"),
+                    entry.get("keep_alive"),
+                )
+            except Exception as retry_exc:
+                logger.warning(
+                    "warmup: %s failed after pull: %s",
+                    model,
+                    retry_exc,
+                )
+        else:
+            logger.warning("warmup: %s failed: %s", model, exc)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        logger.warning(
+            "warmup: Ollama host unreachable during warmup for '%s': %s",
+            model,
+            exc,
         )
     except Exception as exc:
         logger.warning("warmup: %s failed: %s", model, exc)
@@ -538,94 +641,6 @@ def _coerce_tool_arguments(args: Any) -> dict:
     return {}
 
 
-def _split_headroom_tool_calls(tool_calls: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    headroom_calls: list[dict[str, Any]] = []
-    other_calls: list[dict[str, Any]] = []
-    for call in tool_calls:
-        fn = call.get("function") or {}
-        name = str(fn.get("name") or "")
-        if name == "headroom_retrieve":
-            headroom_calls.append(call)
-        else:
-            other_calls.append(call)
-    return headroom_calls, other_calls
-
-
-def _resolve_headroom_tool_messages(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    tool_messages: list[dict[str, Any]] = []
-    for call in tool_calls:
-        fn = call.get("function") or {}
-        args = _coerce_tool_arguments(fn.get("arguments"))
-        hash_key = args.get("hash") or args.get("reference") or args.get("id")
-        query = args.get("query")
-        if not hash_key:
-            content = json.dumps({"error": "missing_hash", "tool": "headroom_retrieve"})
-        else:
-            retrieved = retrieve_from_ccr(str(hash_key), str(query) if query is not None else None)
-            if retrieved is None:
-                content = json.dumps({"error": "not_found", "hash": str(hash_key), "query": query})
-            else:
-                content = retrieved
-
-        call_id = call.get("id") or f"ccr_{uuid.uuid4().hex[:24]}"
-        call["id"] = call_id
-        tool_messages.append({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": content,
-        })
-    return tool_messages
-
-
-async def _continue_after_headroom_retrieve(
-    *,
-    payload: dict[str, Any],
-    assistant_content: str,
-    headroom_calls: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Resolve internal headroom_retrieve calls and continue generation transparently."""
-    if not headroom_calls:
-        return {"message": {"content": assistant_content}}
-
-    hop_payload = dict(payload)
-    hop_payload["stream"] = False
-    hop_payload["messages"] = list(payload.get("messages") or [])
-    hop_payload["messages"].append(
-        {
-            "role": "assistant",
-            "content": assistant_content,
-            "tool_calls": headroom_calls,
-        }
-    )
-    hop_payload["messages"].extend(_resolve_headroom_tool_messages(headroom_calls))
-
-    for _ in range(max(1, MAX_HEADROOM_RETRIEVE_HOPS)):
-        response = await _ollama_post("/api/chat", hop_payload, stream=False)
-        if response.status_code >= 400:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
-
-        result = response.json()
-        message = result.get("message") or {}
-        tool_calls = message.get("tool_calls") or []
-        if not tool_calls:
-            return result
-
-        headroom_only, _other = _split_headroom_tool_calls(tool_calls)
-        if not headroom_only:
-            return result
-
-        hop_payload["messages"].append(
-            {
-                "role": "assistant",
-                "content": message.get("content", "") or "",
-                "tool_calls": tool_calls,
-            }
-        )
-        hop_payload["messages"].extend(_resolve_headroom_tool_messages(headroom_only))
-
-    raise HTTPException(status_code=502, detail="Exceeded headroom retrieval continuation limit")
-
-
 def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Translate incoming messages (OpenAI-shape or Anthropic-shape content
     blocks as emitted by Zoo Code / Roo Code) into the shape Ollama's
@@ -740,6 +755,58 @@ def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         out.append(norm)
 
+    return out
+
+
+def _serialize_tool_arguments_for_headroom(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert tool call arguments from dicts to JSON strings for Headroom compression.
+    
+    Headroom's compression pipeline requires all content to be strings. This function
+    serializes dict-type tool arguments into JSON strings before passing messages to
+    headroom.compress(). The result is deserialized back to dicts after compression.
+    """
+    out = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        
+        norm_msg = dict(msg)
+        
+        # Convert tool call arguments from dicts to JSON strings
+        if "tool_calls" in norm_msg and isinstance(norm_msg["tool_calls"], list):
+            serialized_tool_calls = []
+            for tc in norm_msg["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                
+                # If arguments is a dict or list, serialize it to a JSON string
+                if isinstance(args, (dict, list)):
+                    try:
+                        args_str = json.dumps(args)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "router: failed to serialize tool arguments for headroom: %r",
+                            str(args)[:200],
+                        )
+                        args_str = "{}"
+                elif args is None:
+                    args_str = "{}"
+                else:
+                    # Already a string, keep as-is
+                    args_str = str(args) if not isinstance(args, str) else args
+                
+                serialized_tc = dict(tc)
+                if fn is not None:
+                    serialized_fn = dict(fn) if isinstance(fn, dict) else {}
+                    serialized_fn["arguments"] = args_str
+                    serialized_tc["function"] = serialized_fn
+                serialized_tool_calls.append(serialized_tc)
+            norm_msg["tool_calls"] = serialized_tool_calls
+        
+        out.append(norm_msg)
+    
     return out
 
 
@@ -895,7 +962,11 @@ async def healthz() -> JSONResponse:
             resp.raise_for_status()
         return JSONResponse({"status": "ok"})
     except Exception as exc:
-        return JSONResponse({"status": "degraded", "error": str(exc)}, status_code=503)
+        error_response = _safe_error_response(exc, "healthz: Ollama health check")
+        return JSONResponse(
+            {"status": "degraded", **error_response},
+            status_code=503
+        )
 
 
 @app.get("/v1/models")
@@ -929,11 +1000,15 @@ async def chat_completions(request: Request):
     # Perform preflight check
     logger.info("Starting preflight check for model %s", model_name)
     if not await _preflight_model(model_name):
-        logger.error("Preflight check failed for model %s", model_name)
-        if AUTO_PULL_MISSING_MODELS:
-            raise HTTPException(status_code=500, detail=f"Failed to pull model {model_name}")
-        else:
-            raise HTTPException(status_code=404, detail=f"Model {model_name} not available and auto-pull disabled")
+        error_response = _safe_error_response(
+            Exception(f"Preflight check failed for model {model_name}"),
+            "chat_completions: preflight model check"
+        )
+        status_code = 500 if AUTO_PULL_MISSING_MODELS else 404
+        raise HTTPException(
+            status_code=status_code,
+            detail=error_response["error"]["message"]
+        )
     
     logger.info("Preflight check passed for model %s", model_name)
 
@@ -952,19 +1027,23 @@ async def chat_completions(request: Request):
     payload = _build_ollama_payload(body, think=think)
     stream_options = body.get("stream_options") or {}
     include_stream_usage = bool(stream_options.get("include_usage", False))
+
     policy_entry = MODEL_POLICY.get(model_name, {})
-    headroom_result = check_and_trim(payload["messages"], model_name, policy_entry)
+    
+    # Serialize tool arguments for Headroom compression (converts dicts to JSON strings)
+    headroom_messages = _serialize_tool_arguments_for_headroom(payload["messages"])
+    
+    try:
+        headroom_result = check_and_trim(headroom_messages, model_name, policy_entry)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if headroom_result.rejected:
         raise HTTPException(status_code=413, detail=headroom_result.error_response)
-    if headroom_result.trimmed:
-        logger.info(
-            "router: trimmed request for model=%s prompt_tokens=%s budget=%s reason=%s",
-            model_name,
-            headroom_result.prompt_tokens,
-            headroom_result.usable_prompt_budget,
-            headroom_result.trim_reason,
-        )
-        payload["messages"] = headroom_result.messages
+    
+    # Headroom returns messages with JSON string arguments; _deserialize_tool_arguments()
+    # in router_headroom.py converts them back to dicts for Ollama compatibility.
+    payload["messages"] = headroom_result.messages
+
     stream = payload.get("stream", False)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1017,7 +1096,7 @@ async def chat_completions(request: Request):
                 try:
                     logger.debug("About to call Ollama /api/chat for streaming model %s", model)
                     timeout = httpx.Timeout(
-                        connect=10.0, read=1200.0, write=30.0, pool=30.0
+                        connect=10.0, read=1800.0, write=30.0, pool=30.0
                     )
                     async with httpx.AsyncClient(timeout=timeout) as client:
                         async with client.stream(
@@ -1046,10 +1125,9 @@ async def chat_completions(request: Request):
                                 error_text = (await resp.aread()).decode(
                                     "utf-8", errors="ignore"
                                 )
-                                logger.error(
-                                    "ollama upstream error %s: %s",
-                                    resp.status_code,
-                                    error_text[:500],
+                                error_response = _safe_error_response(
+                                    Exception(f"Ollama upstream error status={resp.status_code}: {error_text[:500]}"),
+                                    "streaming: Ollama upstream"
                                 )
                                 err_chunk = {
                                     "id": completion_id,
@@ -1062,9 +1140,9 @@ async def chat_completions(request: Request):
                                         "finish_reason": "error",
                                     }],
                                     "error": {
-                                        "message": error_text or f"upstream status {resp.status_code}",
-                                        "type": "upstream_error",
-                                        "code": resp.status_code,
+                                        "message": error_response["error"]["message"],
+                                        "type": error_response["error"]["type"],
+                                        "code": error_response["error"]["code"],
                                     },
                                 }
                                 await queue.put(
@@ -1073,8 +1151,6 @@ async def chat_completions(request: Request):
                                 return
 
                             saw_tool_calls = False
-                            pending_headroom_calls: list[dict[str, Any]] = []
-                            assistant_content_parts: list[str] = []
                             async for line in resp.aiter_lines():
                                 if not line.strip():
                                     continue
@@ -1083,11 +1159,7 @@ async def chat_completions(request: Request):
 
                                 # Tool-call delta translation.
                                 raw_tool_calls = message.get("tool_calls") or []
-                                headroom_calls, passthrough_calls = _split_headroom_tool_calls(raw_tool_calls)
-                                if headroom_calls:
-                                    pending_headroom_calls.extend(headroom_calls)
-
-                                tc_deltas = _streaming_tool_call_deltas(passthrough_calls)
+                                tc_deltas = _streaming_tool_call_deltas(raw_tool_calls)
                                 if tc_deltas:
                                     saw_tool_calls = True
                                     tc_chunk = {
@@ -1108,7 +1180,6 @@ async def chat_completions(request: Request):
                                 # Plain content delta.
                                 token = message.get("content", "")
                                 if token:
-                                    assistant_content_parts.append(token)
                                     chunk = {
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
@@ -1125,87 +1196,6 @@ async def chat_completions(request: Request):
                                     )
 
                                 if data.get("done"):
-                                    if pending_headroom_calls:
-                                        continued = await _continue_after_headroom_retrieve(
-                                            payload=payload,
-                                            assistant_content="".join(assistant_content_parts),
-                                            headroom_calls=pending_headroom_calls,
-                                        )
-                                        continued_message = continued.get("message") or {}
-                                        continued_tool_calls = continued_message.get("tool_calls") or []
-                                        continued_headroom, continued_passthrough = _split_headroom_tool_calls(continued_tool_calls)
-                                        if continued_headroom:
-                                            logger.warning(
-                                                "router: unresolved nested headroom_retrieve tool calls after continuation"
-                                            )
-
-                                        continued_tc = _streaming_tool_call_deltas(continued_passthrough)
-                                        if continued_tc:
-                                            saw_tool_calls = True
-                                            continued_tool_chunk = {
-                                                "id": completion_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created,
-                                                "model": model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {"tool_calls": continued_tc},
-                                                    "finish_reason": None,
-                                                }],
-                                            }
-                                            await queue.put(
-                                                f"data: {json.dumps(continued_tool_chunk)}\n\n"
-                                            )
-
-                                        continued_content = continued_message.get("content", "") or ""
-                                        if continued_content:
-                                            continued_content_chunk = {
-                                                "id": completion_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created,
-                                                "model": model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {"content": continued_content},
-                                                    "finish_reason": None,
-                                                }],
-                                            }
-                                            await queue.put(
-                                                f"data: {json.dumps(continued_content_chunk)}\n\n"
-                                            )
-
-                                        usage_chunk = _build_stream_usage_chunk(
-                                            include_usage=include_stream_usage,
-                                            completion_id=completion_id,
-                                            created=created,
-                                            model=model,
-                                            done_data=continued,
-                                        )
-                                        if usage_chunk is not None:
-                                            await queue.put(f"data: {json.dumps(usage_chunk)}\n\n")
-
-                                        finish_reason = "tool_calls" if continued_passthrough else (
-                                            continued.get("done_reason")
-                                            if continued.get("done_reason") in ("stop", "length", "content_filter")
-                                            else "stop"
-                                        )
-                                        continued_end_chunk = {
-                                            "id": completion_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": created,
-                                            "model": model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {},
-                                                "finish_reason": finish_reason,
-                                            }],
-                                        }
-                                        await queue.put(
-                                            f"data: {json.dumps(continued_end_chunk)}\n\n"
-                                        )
-                                        await queue.put("data: [DONE]\n\n")
-                                        break
-
                                     usage_chunk = _build_stream_usage_chunk(
                                         include_usage=include_stream_usage,
                                         completion_id=completion_id,
@@ -1241,7 +1231,7 @@ async def chat_completions(request: Request):
                                     await queue.put("data: [DONE]\n\n")
                                     break
                 except Exception as exc:
-                    logger.exception("router: reader task failed: %s", exc)
+                    error_response = _safe_error_response(exc, "streaming: reader task")
                     err_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -1253,8 +1243,9 @@ async def chat_completions(request: Request):
                             "finish_reason": "error",
                         }],
                         "error": {
-                            "message": str(exc),
-                            "type": "router_error",
+                            "message": error_response["error"]["message"],
+                            "type": error_response["error"]["type"],
+                            "code": error_response["error"]["code"],
                         },
                     }
                     await queue.put(f"data: {json.dumps(err_chunk)}\n\n")
@@ -1301,26 +1292,20 @@ async def chat_completions(request: Request):
     
     logger.debug("Ollama /api/chat response for non-streaming: status %d", response.status_code)
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
+        error_response = _safe_error_response(
+            Exception(f"Ollama error status={response.status_code}: {response.text[:500]}"),
+            "chat_completions: Ollama upstream"
+        )
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=error_response["error"]["message"]
+        )
 
     result = response.json()
     ollama_message = result.get("message") or {}
 
-    # Transparently resolve internal Headroom CCR retrieval calls before returning to clients.
-    headroom_calls, _other_calls = _split_headroom_tool_calls(ollama_message.get("tool_calls") or [])
-    if headroom_calls:
-        result = await _continue_after_headroom_retrieve(
-            payload=payload,
-            assistant_content=ollama_message.get("content", "") or "",
-            headroom_calls=headroom_calls,
-        )
-        ollama_message = result.get("message") or {}
-
     content = ollama_message.get("content", "") or ""
-    _headroom_final, passthrough_final = _split_headroom_tool_calls(ollama_message.get("tool_calls") or [])
-    if _headroom_final:
-        logger.warning("router: suppressing unresolved headroom_retrieve tool calls from client response")
-    tool_calls = _translate_tool_calls(passthrough_final)
+    tool_calls = _translate_tool_calls(ollama_message.get("tool_calls") or [])
 
     assistant_message = {"role": "assistant", "content": content}
     if tool_calls:
@@ -1366,10 +1351,15 @@ async def embeddings(request: Request):
 
     logger.info("Starting preflight check for embedding model %s", model)
     if not await _preflight_model(model):
-        logger.error("Preflight check failed for embedding model %s", model)
-        if AUTO_PULL_MISSING_MODELS:
-            raise HTTPException(status_code=500, detail=f"Failed to pull model {model}")
-        raise HTTPException(status_code=404, detail=f"Model {model} not available and auto-pull disabled")
+        error_response = _safe_error_response(
+            Exception(f"Preflight check failed for embedding model {model}"),
+            "embeddings: preflight model check"
+        )
+        status_code = 500 if AUTO_PULL_MISSING_MODELS else 404
+        raise HTTPException(
+            status_code=status_code,
+            detail=error_response["error"]["message"]
+        )
 
     inputs = _coerce_embedding_inputs(body.get("input"))
     data = []

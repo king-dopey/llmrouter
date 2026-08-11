@@ -31,15 +31,15 @@ Mapping by profile:
 ### Orin
 
 ```bash
-PROFILE=orin docker compose up -d
-PROFILE=orin docker compose -f router/docker-compose.yml --profile proxy up -d --build
+HARDWARE_PROFILE=orin docker compose up -d
+HARDWARE_PROFILE=orin docker compose -f router/docker-compose.yml --profile proxy up -d --build
 ```
 
 ### Thor
 
 ```bash
-PROFILE=thor docker compose up -d
-PROFILE=thor docker compose -f router/docker-compose.yml --profile proxy up -d --build
+HARDWARE_PROFILE=thor docker compose up -d
+HARDWARE_PROFILE=thor docker compose -f router/docker-compose.yml --profile proxy up -d --build
 ```
 
 ## Validation commands
@@ -54,15 +54,15 @@ scripts/validation/validate-shared-stack.sh thor
 ### Explicit model-tag validation (fails on unavailable tags)
 
 ```bash
-PROFILE=orin scripts/validation/validate-model-tags.sh orin
-PROFILE=thor scripts/validation/validate-model-tags.sh thor
+HARDWARE_PROFILE=orin scripts/validation/validate-model-tags.sh orin
+HARDWARE_PROFILE=thor scripts/validation/validate-model-tags.sh thor
 ```
 
 ### Runtime gate checks
 
 ```bash
-PROFILE=orin scripts/validation/validate-runtime-gates.sh orin
-PROFILE=thor scripts/validation/validate-runtime-gates.sh thor
+HARDWARE_PROFILE=orin scripts/validation/validate-runtime-gates.sh orin
+HARDWARE_PROFILE=thor scripts/validation/validate-runtime-gates.sh thor
 ```
 
 ### Manual health checks
@@ -82,7 +82,7 @@ free -h
 
 ## Notes
 
-- Orin default is preserved when `PROFILE` is unset.
+- Orin default is preserved when `HARDWARE_PROFILE` is unset.
 - Runtime profile model policy is mounted into router at `/app/model_policy.yml` from `profiles/<profile>/models.yaml`.
 - The repository does not include a first-party LibreChat compose file; it provides profile-resolved LibreChat modelspec files for external LibreChat deployment.
 
@@ -99,10 +99,10 @@ The ASR service uses different Python versions per profile to match the Jetson w
 
 ```bash
 # Orin ASR (default)
-PROFILE=orin docker compose --profile asr up -d
+HARDWARE_PROFILE=orin docker compose --profile asr up -d
 
 # Thor ASR
-PROFILE=thor docker compose --profile asr up -d
+HARDWARE_PROFILE=thor docker compose --profile asr up -d
 ```
 
 ### Build-time Variables

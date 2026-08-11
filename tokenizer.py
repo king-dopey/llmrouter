@@ -93,10 +93,12 @@ def _make_tiktoken_counter(enc_name: str) -> Optional[Callable[[str], int]]:
     return _count
 
 
-def _approx_count(text: str) -> int:
+def _estimate_tokens(text: str) -> int:
+    """Return a deterministic, conservative estimate without external side effects."""
     if not text:
         return 0
-    return max(0, len(text) // 4)
+    byte_count = len(text.encode("utf-8"))
+    return max(1, (byte_count + 2) // 3)
 
 
 def _get_counter_for_model(model: str) -> Callable[[str], int]:
@@ -110,7 +112,7 @@ def _get_counter_for_model(model: str) -> Callable[[str], int]:
                 break
     if choice:
         if choice.strip().lower() == "approximate":
-            return _approx_count
+            return _estimate_tokens
         if choice.startswith("tiktoken:"):
             enc_name = choice.split(":", 1)[1]
             counter = _make_tiktoken_counter(enc_name)
@@ -125,7 +127,7 @@ def _get_counter_for_model(model: str) -> Callable[[str], int]:
             return counter
 
     # final fallback
-    return _approx_count
+    return _estimate_tokens
 
 
 def count_prompt_tokens(messages: List[Dict[str, Any]], model: str) -> int:
@@ -135,8 +137,8 @@ def count_prompt_tokens(messages: List[Dict[str, Any]], model: str) -> int:
     try:
         return int(counter(text))
     except Exception:
-        logger.exception("router.tokenizer: counter failed; falling back to approximate")
-        return _approx_count(text)
+        logger.exception("router.tokenizer: counter failed; falling back to estimation")
+        return _estimate_tokens(text)
 
 
 def count_completion_tokens(text: str, model: str) -> int:
@@ -145,8 +147,8 @@ def count_completion_tokens(text: str, model: str) -> int:
     try:
         return int(counter(text or ""))
     except Exception:
-        logger.exception("router.tokenizer: completion counter failed; falling back to approximate")
-        return _approx_count(text or "")
+        logger.exception("router.tokenizer: completion counter failed; falling back to estimation")
+        return _estimate_tokens(text or "")
 
 
 __all__ = ["count_prompt_tokens", "count_completion_tokens"]
