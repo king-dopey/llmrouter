@@ -1,27 +1,84 @@
+# Thor model policy
+#
+# This file is tuned for real-world local use on Thor after observing:
+#   - qwen3.8:27b-bf16 can deliver high quality, but may massively overrun
+#     wall-clock time on standard coding if reasoning is left unconstrained
+#   - laguna-xs-2.1 loops too often in this environment to remain a primary coder
+#   - qwen3.6:35b-a3b-q8_0 remains the best completion-time default
+#   - qwen3-embedding:8b is in constant use for code indexing/search
+#
+# ---------------------------------------------------------------------------
 # Zoo Code routing guidance
+# ---------------------------------------------------------------------------
+# Default ladder:
+#   1) qwen3.6:35b-a3b-q8_0   -> default for standard coding/planning/debug/docs/review
+#   2) qwen3.8:27b-q8_0       -> escalation for hard coding/planning/repo reasoning
+#   3) qwen3.8:27b-bf16       -> explicit quality-first/manual escalation only
+#   4) granite4.1-guardian    -> security review gate
 #
-# Primary mode -> model mapping
-#   architect             -> qwen3.6:35b-a3b-q8_0
-#   code                  -> laguna-xs-2.1:q4_K_M
-#   tester                -> qwen3.6:35b-a3b-q8_0
-#   reviewer              -> qwen3.6:35b-a3b-q8_0
-#   security-review       -> granite4.1-guardian:8b-q6_K
-#   documentation-writer  -> qwen3.6:35b-a3b-q8_0
-#   debug                 -> qwen3.6:35b-a3b-q8_0
-#   planning-prompt       -> qwen3.6:35b-a3b-q8_0
+# Supporting roles:
+#   - qwen3-coder-next        -> direct edit / non-thinking / parser-stable fallback
+#   - laguna-xs-2.1           -> experimental alternate only; demoted due to loop risk
+#   - qwen3-embedding:8b      -> always-hot code search / indexing
 #
-# Secondary / fallback suggestions
-#   code fast fallback    -> qwen3-coder-next:q4_K_M
-#   long-context alt code -> north-mini-code-1.0:q8_0
-#   alt reasoning         -> gpt-oss:20b
-#   vision compatibility  -> qwen3-vl:4b
-#   small compatibility   -> qwen3:4b
-#   small replacement     -> qwen3.5:4b
-#   embeddings primary    -> qwen3-embedding:8b
-#   embeddings transition -> qwen3-embedding:4b
+# ---------------------------------------------------------------------------
+# Operational notes
+# ---------------------------------------------------------------------------
+# Why qwen3.6 is primary again:
+#   qwen3.6:35b-a3b is a 35B-total / 3B-active MoE model.
+#   It is much cheaper per generated token than dense qwen3.8:27b.
+#   In practice, use qwen3.6 when bounded completion time matters.
+#
+# Why qwen3.8:q8_0 is preferred over qwen3.8:bf16 for default escalation:
+#   - same underlying model family
+#   - q8_0 is much lighter and faster locally
+#   - bf16 is reserved for "important and hard" tasks, not routine loops
+#
+# Rough practical planning multipliers relative to qwen3.6 baseline:
+#   qwen3.6:35b-a3b-q8_0      = 1.0x
+#   qwen3-coder-next:q4_K_M   = ~0.9x to 1.4x
+#   laguna-xs-2.1:q4_K_M      = ~1.0x to 2.0x (but high loop risk)
+#   qwen3.8:27b-q8_0          = ~4x to 8x task-time on standard agent loops
+#   qwen3.8:27b-bf16          = ~8x to 15x task-time on standard agent loops
+#   qwen3.8:27b-bf16 default-style runaway
+#                              = ~15x to 30x worst case if reasoning is not controlled
+#
+# Important:
+#   This YAML can set safe local defaults, but it cannot fully express
+#   request-time reasoning controls used by OpenAI-compatible routers.
+#   For qwen3.8, the router should prefer LOWER/MEDIUM reasoning for normal work,
+#   and only enable high/deep reasoning explicitly.
+#
+# Recommended router-side profiles:
+#   qwen3.6 standard          -> default
+#   qwen3.6 deep              -> higher-complexity planning/review
+#   qwen3.8 q8 medium         -> hard planning / hard coding escalation
+#   qwen3.8 bf16 medium       -> explicit quality-first escalation
+#
+# Memory shape:
+#   always-hot:
+#     qwen3.6:35b-a3b-q8_0    ~39 GB
+#     qwen3-embedding:8b      ~4.7 GB
+#   static hot total          ~43.7 GB
+#
+# This leaves enough headroom for:
+#   - qwen3.8:q8_0 timed residency
+#   - large contexts on qwen3.6
+#   - embedding traffic
+#   - runtime buffers / KV cache / containers
+#
+# If you later choose to re-promote qwen3.8, prefer q8_0 before bf16 for automation.
 
 models:
-  # Default chat / architect / tester / reviewer / debug / docs
+  # Primary default model
+  # Use for:
+  #   - discovery of complexity
+  #   - easy standard script tasks
+  #   - standard agent loop coding
+  #   - standard planning
+  #   - debugging
+  #   - documentation
+  #   - quality review
   - model: qwen3.6:35b-a3b-q8_0
     keep_alive: -1
     think: true
@@ -29,23 +86,13 @@ models:
     options:
       num_ctx: 262144
       num_batch: 384
-      temperature: 0.20
-      top_p: 0.95
-      repeat_penalty: 1.03
-
-  # Primary Zoo Code implementation model
-  - model: laguna-xs-2.1:q4_K_M
-    keep_alive: -1
-    think: true
-    warmup: true
-    options:
-      num_ctx: 262144
-      num_batch: 384
-      temperature: 0.10
+      temperature: 0.18
       top_p: 0.90
       repeat_penalty: 1.03
 
   # Primary code-search / indexing model
+  # Always hot because indexing/search is continuous.
+  # Native embedding dimension for 8b is 4096.
   - model: qwen3-embedding:8b
     keep_alive: -1
     think: false
@@ -54,19 +101,81 @@ models:
       num_ctx: 40960
       num_batch: 512
 
-  # Fast coding fallback; not pinned because of 52GB model size
-  - model: qwen3-coder-next:q4_K_M
+  # Main escalation model for:
+  #   - complex agent loop coding
+  #   - complex planning
+  #   - multi-level planning
+  #   - difficult repo reasoning
+  #
+  # Intentionally not pinned forever:
+  #   use as the main "hard task" upgrade over qwen3.6,
+  #   but avoid making it the default for every coding loop.
+  #
+  # Router-side recommendation:
+  #   keep reasoning conservative/medium for most tasks.
+  - model: qwen3.8:27b-q8_0
     keep_alive: 45m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 262144
+      num_batch: 320
+      temperature: 0.15
+      top_p: 0.90
+      repeat_penalty: 1.03
+
+  # Explicit quality-first model
+  # Use only for:
+  #   - hard manual escalations
+  #   - important complex planning
+  #   - difficult code generation when longer runtime is acceptable
+  #
+  # Not recommended as the default automation model.
+  # In practice, pair with router-side bounded reasoning.
+  - model: qwen3.8:27b-bf16
+    keep_alive: 15m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 262144
+      num_batch: 192
+      temperature: 0.12
+      top_p: 0.90
+      repeat_penalty: 1.03
+
+  # Direct-edit / no-think coding fallback
+  # Good when:
+  #   - the task is straightforward
+  #   - parser-stable output matters
+  #   - overbuilding must be minimized
+  #
+  # Kept active but deprecated as a primary coder.
+  - model: qwen3-coder-next:q4_K_M
+    keep_alive: 30m
     think: false
     warmup: false
     options:
       num_ctx: 131072
       num_batch: 256
-      temperature: 0.12
-      top_p: 0.95
+      temperature: 0.10
+      top_p: 0.90
       repeat_penalty: 1.05
 
-  # Strong general fallback
+  # Demoted experimental coding alternative
+  # Retained only for A/B and explicit alternate-behavior tests.
+  # Developer/operator feedback indicates high loop risk in this environment.
+  - model: laguna-xs-2.1:q4_K_M
+    keep_alive: 15m
+    think: true
+    warmup: false
+    options:
+      num_ctx: 131072
+      num_batch: 192
+      temperature: 0.08
+      top_p: 0.90
+      repeat_penalty: 1.03
+
+  # Strong non-Qwen fallback
   - model: gemma4:31b-it-q4_K_M
     keep_alive: 20m
     think: true
@@ -78,7 +187,7 @@ models:
       top_p: 0.95
       repeat_penalty: 1.05
 
-  # Legacy coding fallback; retained for optional A/B only
+  # Legacy coding fallback; kept for optional comparison
   - model: devstral-small-2:24b-instruct-2512-q8_0
     keep_alive: 15m
     think: true
@@ -102,7 +211,8 @@ models:
       top_p: 0.90
       repeat_penalty: 1.03
 
-  # Security gate / judging model
+  # Security review / policy gate
+  # Primary model for security-review stage.
   - model: granite4.1-guardian:8b-q6_K
     keep_alive: 20m
     think: false
@@ -126,7 +236,7 @@ models:
       top_p: 0.90
       repeat_penalty: 1.05
 
-  # New small replacement path for qwen3:4b and eventually qwen3-vl:4b
+  # Small replacement path
   - model: qwen3.5:4b
     keep_alive: 30m
     think: true
@@ -138,7 +248,7 @@ models:
       top_p: 0.90
       repeat_penalty: 1.05
 
-  # Keep for current vision-dependent callers until they migrate
+  # Vision compatibility model
   - model: qwen3-vl:4b
     keep_alive: 30m
     think: true
@@ -150,6 +260,7 @@ models:
       top_p: 0.90
       repeat_penalty: 1.05
 
+  # Medium-size general alternative
   - model: gemma4:12b
     keep_alive: 20m
     think: true
@@ -167,14 +278,14 @@ models:
     think: false
     warmup: false
     options:
-      num_ctx: 131072
+      num_ctx: 65536
       num_batch: 256
       temperature: 0.0
       top_p: 0.90
 
   # Transition embedding model; keep until all clients move to 8b
   - model: qwen3-embedding:4b
-    keep_alive: 30m
+    keep_alive: 20m
     think: false
     warmup: false
     options:

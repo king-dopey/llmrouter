@@ -12,6 +12,7 @@ services:
     volumes:
       - ${HF_CACHE_HOST_PATH:-./data/hf_cache}:/data/hf_cache
       - ${HEADROOM_CCR_STORE_HOST_PATH:-./data/headroom_ccr}:/data/headroom_ccr
+      - ${HEADROOM_WORKSPACE_HOST_DIR:-./data/headroom}:/data/headroom
       - ./profiles/${HARDWARE_PROFILE:-orin}/models.yaml:/app/model_policy.yml:ro
     ports:
       - "${ROUTER_BIND_IP:-0.0.0.0}:${ROUTER_PORT:-4000}:${ROUTER_INTERNAL_PORT:-4000}"

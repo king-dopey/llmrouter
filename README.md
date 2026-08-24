@@ -132,12 +132,12 @@ The Orin 64 GB node is sized to keep two MoE models warm by default while leavin
 
 | Model ID | Purpose | Default keep_alive | Default think | Supported `num_ctx` Ceiling | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `qwen3-coder:30b` | Strict-JSON and structured-output workloads for boundary selection and cue-ID extraction. | `-1` | `false` | `65536` | Primary coding model; stays warm. |
-| `qwen3.6:35b-a3b` | Default chat and narrative summarization workloads. | `10m` | `true` | `32768` | Hybrid attention keeps KV usage comparatively small. |
+| `qwen3.6:35b-a3b` | Default chat and narrative summarization workloads. | `-1` (stay warm) | `true` | `32768` | Primary default model; hybrid attention keeps KV usage comparatively small. |
+| `qwen3-embedding:4b` | Embedding service for Qdrant retrieval. | `-1` (stay warm) | `false` | `8192` | Always resident for continuous retrieval. |
+| `qwen3-coder:30b` | Strict-JSON and structured-output workloads for boundary selection and cue-ID extraction. | `10m` | `false` | `65536` | Coding model; no longer pinned, stays warm during use. |
 | `qwen3:4b` | Fast assistant / routing model. | `10m` | `true` | `65536` | Lightweight fallback for simple queries. |
 | `qwen3-vl:4b` | Vision-language tasks (image understanding). | `10m` | `true` | `65536` | Multimodal input support. |
 | `gemma4:12b` | Mid-tier general-purpose model. | `10m` | `true` | `65536` | Alternative for creative tasks. |
-| `qwen3-embedding:4b` | Embedding service for Qdrant retrieval. | `5m` | `false` | `8192` | Used by retrieval pipeline. |
 | `nemotron-cascade-2:30b-a3b-q4_K_M` | Optional reasoning verifier for ambiguous structured answers. | `10m` | `true` | `65536` | Only resident while actively in use; expect one warm-model eviction when it loads. |
 | `gpt-oss:20b` | Secondary general-purpose model. | `10m` | `true` | `65536` | Fallback for diverse tasks. |
 | `laguna-xs-2.1:q4_K_M` | Lightweight reasoning / utility model. | `10m` | `true` | `65536` | Small-footprint helper. |
@@ -164,20 +164,24 @@ The Thor profile targets larger context windows and a broader model catalog, lev
 
 | Model ID | Purpose | Default keep_alive | Default think | Supported `num_ctx` Ceiling | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `qwen3-coder-next:q4_K_M` | Next-gen coding model for structured-output workloads. | `45m` | `false` | `262144` | Primary coding model; stays warm with large context. |
-| `qwen3.6:35b-a3b-q8_0` | Default chat and narrative summarization workloads. | `-1` | `true` | `262144` | Stays warm; higher precision KV cache. |
-| `gemma4:31b-it-q4_K_M` | Large general-purpose model. | `20m` | `true` | `131072` | Heavyweight but capable for complex tasks. |
+| `qwen3.6:35b-a3b-q8_0` | Default chat and primary coding/planning model. | `-1` (stay warm) | `true` | `262144` | Primary default; stays warm for all standard workloads. |
+| `qwen3-embedding:8b` | Code search / indexing embedding model. | `-1` (stay warm) | `false` | `40960` | Always hot; native 4096-dim embeddings for code indexing. |
+| `qwen3.8:27b-q8_0` | Escalation model for complex coding/planning/reasoning. | `45m` | `true` | `262144` | Hard task upgrade over qwen3.6; router-side medium reasoning recommended. |
+| `qwen3.8:27b-bf16` | Explicit quality-first model for important complex tasks. | `15m` | `true` | `262144` | Manual escalation only; ~8-15x task-time vs qwen3.6 baseline. |
+| `qwen3-coder-next:q4_K_M` | Direct-edit / no-think coding fallback for straightforward tasks. | `30m` | `false` | `131072` | Parser-stable output; deprecated as primary coder. |
+| `laguna-xs-2.1:q4_K_M` | Experimental coding alternative (high loop risk). | `15m` | `true` | `131072` | A/B testing only; demoted due to loop risk in this environment. |
+| `gemma4:31b-it-q4_K_M` | Large non-Qwen general-purpose model. | `20m` | `true` | `131072` | Heavyweight but capable for complex tasks. |
 | `devstral-small-2:24b-instruct-2512-q8_0` | French-language and multilingual instruction model. | `15m` | `true` | `131072` | Specialized language support. |
 | `north-mini-code-1.0:q8_0` | Compact coding assistant. | `15m` | `true` | `131072` | Fast code generation. |
-| `granite4.1-guardian:8b-q6_K` | Guardrail / safety classification model. | `20m` | `false` | `65536` | Non-thinking safety filter. |
+| `granite4.1-guardian:8b-q6_K` | Security review / policy gate model. | `20m` | `false` | `65536` | Primary model for security-review stage. |
 | `qwen3:4b` | Fast assistant / routing model. | `30m` | `true` | `65536` | Lightweight fallback. |
-| `qwen3-vl:4b` | Vision-language tasks (image understanding). | `30m` | `true` | `65536` | Multimodal input support. |
-| `gemma4:12b` | Mid-tier general-purpose model. | `20m` | `true` | `65536` | Creative tasks alternative. |
+| `qwen3.5:4b` | Small replacement path for qwen3:4b and qwen3-vl:4b. | `30m` | `true` | `65536` | Successor to qwen3:4b. |
+| `qwen3-vl:4b` | Vision-language tasks (image understanding). | `30m` | `true` | `65536` | Multimodal input support; kept until callers migrate. |
+| `gemma4:12b` | Medium-size general alternative. | `20m` | `true` | `65536` | Creative tasks alternative. |
 | `reader-lm:1.5b` | Document reading / extraction specialist. | `20m` | `false` | `65536` | Non-thinking document processing. |
-| `qwen3-embedding:4b` | Embedding service for Qdrant retrieval. | `30m` | `false` | `8192` | Used by retrieval pipeline. |
+| `qwen3-embedding:4b` | Transition embedding model (deprecated in favor of 8b). | `20m` | `false` | `8192` | Keep until all clients move to 8b. |
 | `nemotron-cascade-2:30b-a3b-q4_K_M` | Optional reasoning verifier. | `15m` | `true` | `131072` | Reasoning verification. |
 | `gpt-oss:20b` | Secondary general-purpose model. | `15m` | `true` | `131072` | Diverse task fallback. |
-| `laguna-xs-2.1:q4_K_M` | Lightweight reasoning / utility model. | `-1` (stay warm) | `true` | `131072` | Small-footprint helper. |
 
 ## Operator Host Setup
 
@@ -311,12 +315,12 @@ This behavior is controlled by the `AUTO_PULL_MISSING_MODELS` environment variab
 These are the models pre-configured in the Orin profile:
 
 ```bash
+ollama pull qwen3.6:35b-a3b
+ollama pull qwen3-embedding:4b
 ollama pull qwen3-coder:30b
-ollama pull qwen3.6:35b-a3b-q8_0
 ollama pull qwen3:4b
 ollama pull qwen3-vl:4b
 ollama pull gemma4:12b
-ollama pull qwen3-embedding:4b
 # Optional models:
 ollama pull nemotron-cascade-2:30b-a3b-q4_K_M
 ollama pull gpt-oss:20b
@@ -328,13 +332,18 @@ ollama pull laguna-xs-2.1:q4_K_M
 These are the models pre-configured in the Thor profile:
 
 ```bash
-ollama pull qwen3-coder-next:q4_K_M
 ollama pull qwen3.6:35b-a3b-q8_0
+ollama pull qwen3-embedding:8b
+ollama pull qwen3.8:27b-q8_0
+ollama pull qwen3.8:27b-bf16
+ollama pull qwen3-coder-next:q4_K_M
+ollama pull laguna-xs-2.1:q4_K_M
 ollama pull gemma4:31b-it-q4_K_M
 ollama pull devstral-small-2:24b-instruct-2512-q8_0
 ollama pull north-mini-code-1.0:q8_0
 ollama pull granite4.1-guardian:8b-q6_K
 ollama pull qwen3:4b
+ollama pull qwen3.5:4b
 ollama pull qwen3-vl:4b
 ollama pull gemma4:12b
 ollama pull reader-lm:1.5b
@@ -342,7 +351,6 @@ ollama pull qwen3-embedding:4b
 # Optional models:
 ollama pull nemotron-cascade-2:30b-a3b-q4_K_M
 ollama pull gpt-oss:20b
-ollama pull laguna-xs-2.1:q4_K_M
 ```
 
 ## Test Models API
@@ -510,8 +518,9 @@ Router policy defaults by profile:
 
 | Model | keep_alive | think |
 | --- | --- | --- |
-| `qwen3-coder:30b` | `-1` (stay warm) | `false` |
-| `qwen3.6:35b-a3b` | `10m` | `true` |
+| `qwen3.6:35b-a3b` | `-1` (stay warm) | `true` |
+| `qwen3-embedding:4b` | `-1` (stay warm) | `false` |
+| `qwen3-coder:30b` | `10m` | `false` |
 | `nemotron-cascade-2:30b-a3b-q4_K_M` | `10m` | `true` |
 | `qwen3:4b` | `10m` | `true` |
 
@@ -519,9 +528,11 @@ Router policy defaults by profile:
 
 | Model | keep_alive | think |
 | --- | --- | --- |
-| `qwen3-coder-next:q4_K_M` | `45m` | `false` |
 | `qwen3.6:35b-a3b-q8_0` | `-1` (stay warm) | `true` |
-| `gemma4:31b-it-q4_K_M` | `20m` | `true` |
+| `qwen3-embedding:8b` | `-1` (stay warm) | `false` |
+| `qwen3.8:27b-q8_0` | `45m` | `true` |
+| `qwen3.8:27b-bf16` | `15m` | `true` |
+| `qwen3-coder-next:q4_K_M` | `30m` | `false` |
 | `granite4.1-guardian:8b-q6_K` | `20m` | `false` |
 
 ## Headroom-AI Context Management
@@ -618,6 +629,22 @@ curl -sf http://127.0.0.1:6333/healthcheck
 ### Fallback Behavior
 
 If GPU acceleration fails or is unavailable, Qdrant automatically falls back to CPU mode. Monitor logs for warnings about GPU initialization failures.
+
+## Embedding Endpoint Reliability
+
+The embedding endpoint (`/v1/embeddings`) implements automatic retry logic with exponential backoff to handle Ollama's model eviction/reload cycle gracefully. When an embedding model is being reloaded into VRAM/RAM, Ollama returns HTTP 503 (Service Unavailable). The router now retries these requests up to 3 times with increasing delays (1s, 2s, 4s) before returning an error to the client.
+
+### Retry Behavior
+
+| Response | Action | Max Retries |
+|----------|--------|-------------|
+| HTTP 503 (model reloading) | Retry with exponential backoff | 3 attempts |
+| `httpx.ConnectError` | Retry with exponential backoff | 3 attempts |
+| `httpx.ConnectTimeout` | Retry with exponential backoff | 3 attempts |
+| HTTP 4xx (client errors) | No retry, pass through immediately | N/A |
+| HTTP 5xx (other server errors) | No retry, pass through immediately | N/A |
+
+This behavior eliminates transient failures during model warm-up and improves reliability when embedding models are evicted from memory due to GPU pressure.
 
 ## Testing
 

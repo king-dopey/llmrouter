@@ -162,6 +162,75 @@ def _deserialize_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str
     
     return out
 
+
+def _preserve_tool_arguments(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Preserve original tool arguments before headroom compression.
+    
+    Returns a tuple of (messages_for_compression, preserved_arguments_map).
+    The preserved_arguments_map maps message indices to their original tool arguments.
+    """
+    preserved_map: dict[str, Any] = {}
+    messages_for_compression = []
+    
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            messages_for_compression.append(msg)
+            continue
+        
+        norm_msg = dict(msg)
+        
+        if "tool_calls" in norm_msg and isinstance(norm_msg["tool_calls"], list):
+            # Store original tool arguments
+            original_tool_calls = []
+            for tc in norm_msg["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                original_tool_calls.append({
+                    "id": tc.get("id"),
+                    "type": tc.get("type"),
+                    "function": {
+                        "name": fn.get("name"),
+                        "arguments": args  # Keep original (dict or string)
+                    }
+                })
+            
+            if original_tool_calls:
+                preserved_map[f"msg_{i}_tool_calls"] = original_tool_calls
+        
+        messages_for_compression.append(norm_msg)
+    
+    return messages_for_compression, preserved_map
+
+
+def _restore_tool_arguments(
+    messages: list[dict[str, Any]],
+    preserved_map: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Restore original tool arguments after headroom compression.
+    
+    This ensures that tool arguments are not corrupted by headroom compression.
+    """
+    restored_messages = []
+    
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            restored_messages.append(msg)
+            continue
+        
+        norm_msg = dict(msg)
+        key = f"msg_{i}_tool_calls"
+        
+        if key in preserved_map:
+            # Restore original tool arguments
+            norm_msg["tool_calls"] = preserved_map[key]
+        
+        restored_messages.append(norm_msg)
+    
+    return restored_messages
+
+
 def _sanitize_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Remove any Headroom-specific metadata from messages before sending to Ollama.
     
@@ -233,17 +302,23 @@ def _compress(
     if headroom_query is not None:
         compress_kwargs["headroom_query"] = headroom_query
     
+    # Preserve original tool arguments before compression to prevent corruption
+    messages_for_compression, preserved_tool_args = _preserve_tool_arguments(messages)
+    
     try:
         # Call headroom.compress() with valid parameters only
-        result = _headroom_compress(messages, **compress_kwargs)
+        result = _headroom_compress(messages_for_compression, **compress_kwargs)
         
-        normalized_compressed = _normalize_output(result, messages)
+        normalized_compressed = _normalize_output(result, messages_for_compression)
         
         # Sanitize messages to remove any Headroom-specific metadata
         sanitized_messages = _sanitize_messages_for_ollama(normalized_compressed)
         
+        # Restore original tool arguments to prevent corruption from headroom
+        restored_messages = _restore_tool_arguments(sanitized_messages, preserved_tool_args)
+        
         # Deserialize tool arguments back to dicts for Ollama compatibility
-        deserialized_messages = _deserialize_tool_arguments(sanitized_messages)
+        deserialized_messages = _deserialize_tool_arguments(restored_messages)
         
         # Extract telemetry from result
         tokens_before = int(getattr(result, "tokens_before", 0) or 0)
@@ -263,10 +338,11 @@ def _compress(
     except TypeError as e:
         logger.warning("router.headroom: TypeError in compress, retrying with minimal params: %s", e)
         try:
-            result = _headroom_compress(messages, model=model_name)
-            normalized_compressed = _normalize_output(result, messages)
+            result = _headroom_compress(messages_for_compression, model=model_name)
+            normalized_compressed = _normalize_output(result, messages_for_compression)
             sanitized_messages = _sanitize_messages_for_ollama(normalized_compressed)
-            deserialized_messages = _deserialize_tool_arguments(sanitized_messages)
+            restored_messages = _restore_tool_arguments(sanitized_messages, preserved_tool_args)
+            deserialized_messages = _deserialize_tool_arguments(restored_messages)
             return deserialized_messages, int(getattr(result, "tokens_before", 0) or 0), int(getattr(result, "tokens_after", 0) or 0), list(getattr(result, "transforms_applied", []) or [])
         except Exception as e2:
             logger.error("router.headroom: compression failed after fallback: %s", e2)
@@ -299,7 +375,7 @@ def check_and_trim(
         return HeadroomCheckResult(
             rejected=False,
             trimmed=False,
-            messages=messages,
+            messages=_deserialize_tool_arguments(messages),
             prompt_tokens=initial_tokens,
             usable_prompt_budget=budget,
             tokens_before=initial_tokens,

@@ -197,19 +197,125 @@ def _coerce_embedding_inputs(value: Any) -> list[str]:
 
 
 async def _fetch_embedding(model: str, prompt: str) -> list[float]:
+    """Fetch embedding from Ollama with retry logic for transient 503 errors.
+    
+    Handles Ollama's model eviction/reload cycle by retrying on 503 Service Unavailable
+    responses with exponential backoff. This prevents client-facing errors during the
+    brief window when Ollama is reloading a model into VRAM/RAM.
+    
+    Args:
+        model: The embedding model name (e.g., 'qwen3-embedding:4b' or 'qwen3-embedding:8b')
+        prompt: The text to embed
+        
+    Returns:
+        List of float embedding values
+        
+    Raises:
+        HTTPException: 503 if model reloading persists after retries, or other HTTP errors
+    """
     payload = {"model": model, "prompt": prompt}
-    try:
-        response = await _ollama_post("/api/embeddings", payload, stream=False)
-    except Exception:
-        raise HTTPException(status_code=503, detail="Ollama upstream unavailable")
+    max_retries = 3
+    backoff_base = 1.0
+    
+    for attempt in range(max_retries):
+        try:
+            response = await _ollama_post("/api/embeddings", payload, stream=False)
+            
+            if response.status_code == 503:
+                if attempt < max_retries - 1:
+                    wait_time = backoff_base * (2 ** attempt)
+                    logger.warning(
+                        "Ollama 503 (model reloading) for model=%s, retry %d/%d in %.1fs",
+                        model, attempt + 1, max_retries, wait_time
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(
+                        "Ollama 503 (model reloading) for model=%s after %d retries",
+                        model, max_retries
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Ollama upstream unavailable - model reloading"
+                    )
+            
+            if response.status_code >= 400:
+                # Don't retry on client errors (4xx) - they indicate bad requests
+                logger.error(
+                    "Embedding fetch failed for model=%s with status %d: %s",
+                    model, response.status_code, response.text[:200]
+                )
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Ollama error: {response.status_code}"
+                )
+                
+            data = response.json()
+            embedding = data.get("embedding")
+            if not isinstance(embedding, list):
+                raise HTTPException(status_code=502, detail="Invalid embedding response from Ollama")
+            return [float(v) for v in embedding]
+            
+        except httpx.ConnectError as e:
+            # Connection errors are retryable
+            if attempt < max_retries - 1:
+                wait_time = backoff_base * (2 ** attempt)
+                logger.warning(
+                    "Ollama connection error for model=%s, retry %d/%d in %.1fs: %s",
+                    model, attempt + 1, max_retries, wait_time, str(e)[:100]
+                )
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                logger.error(
+                    "Ollama connection error for model=%s after %d retries: %s",
+                    model, max_retries, str(e)[:200]
+                )
+                raise HTTPException(status_code=503, detail="Ollama upstream unavailable")
+                
+        except httpx.ConnectTimeout as e:
+            # Connection timeouts are retryable
+            if attempt < max_retries - 1:
+                wait_time = backoff_base * (2 ** attempt)
+                logger.warning(
+                    "Ollama connection timeout for model=%s, retry %d/%d in %.1fs: %s",
+                    model, attempt + 1, max_retries, wait_time, str(e)[:100]
+                )
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                logger.error(
+                    "Ollama connection timeout for model=%s after %d retries: %s",
+                    model, max_retries, str(e)[:200]
+                )
+                raise HTTPException(status_code=503, detail="Ollama upstream unavailable")
+                
+        except httpx.HTTPStatusError as e:
+            # HTTP status errors - only retry on 503
+            if e.response.status_code == 503 and attempt < max_retries - 1:
+                wait_time = backoff_base * (2 ** attempt)
+                logger.warning(
+                    "Ollama 503 (model reloading) for model=%s, retry %d/%d in %.1fs",
+                    model, attempt + 1, max_retries, wait_time
+                )
+                await asyncio.sleep(wait_time)
+                continue
+            raise
+            
+        except Exception as e:
+            # Other exceptions are not retryable
+            logger.error(
+                "Unexpected error fetching embedding for model=%s: %s",
+                model, str(e)[:200]
+            )
+            raise HTTPException(status_code=503, detail="Ollama upstream unavailable")
+    
+    # Fallback - should not reach here
+    raise HTTPException(status_code=503, detail="Ollama upstream unavailable")
 
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-    data = response.json()
-    embedding = data.get("embedding")
-    if not isinstance(embedding, list):
-        raise HTTPException(status_code=502, detail="Invalid embedding response from Ollama")
-    return [float(v) for v in embedding]
+
+
 
 
 async def _inject_retrieval_context(body: dict[str, Any], messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
