@@ -8,12 +8,22 @@ from typing import Any
 
 import tokenizer
 
+from headroom.compress import CompressConfig  # type: ignore
+
 logger = logging.getLogger("router.headroom")
 
 try:
     from headroom import compress as _headroom_compress  # type: ignore
 except ImportError:  # pragma: no cover - exercised through dependency-failure tests
     _headroom_compress = None
+
+# Module-level singleton — system messages must NEVER be compressed.
+# This preserves Zoo Code's tool definitions, usage instructions, and protocol.
+_HEADROOM_CONFIG = CompressConfig(
+    compress_system_messages=False,  # CRITICAL: prevents corrupting tool-calling protocol
+    compress_user_messages=False,     # Already default, explicit for clarity
+    protect_recent=4,                 # Protect last N turns (already default)
+)
 
 
 @dataclass(frozen=True)
@@ -60,28 +70,41 @@ def _token_count(messages: list[dict[str, Any]], model: str) -> int:
     return int(tokenizer.count_prompt_tokens(messages, model))
 
 
-def _extract_query(messages: list[dict[str, Any]]) -> str | None:
-    """Extract the user's query from messages for relevance scoring.
-    
-    Iterates through messages in reverse order to find the last user message.
-    Returns the content as a string, or None if extraction fails.
+def _validate_tool_integrity(original_messages: list[dict], compressed_messages: list[dict]) -> bool:
+    """Verify tool_calls structure survived compression intact.
+
+    Returns True if all messages maintain structural integrity, False otherwise.
+    When returning False, callers should fall back to original messages.
     """
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content")
-            if isinstance(content, str):
-                return content
-            elif isinstance(content, list):
-                # Multi-modal content: extract text parts
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                if text_parts:
-                    return " ".join(text_parts)
-            # If content is dict or other type, skip this message
-            # and continue looking for a valid user message
-    return None
+    if len(original_messages) != len(compressed_messages):
+        return False
+
+    for orig, comp in zip(original_messages, compressed_messages):
+        # Assistant messages with tool_calls must still have them
+        orig_tc = orig.get("tool_calls")
+        comp_tc = comp.get("tool_calls")
+        if bool(orig_tc) != bool(comp_tc):
+            return False
+
+        # System message content must be unchanged (guaranteed by Fix A, but verify)
+        if orig.get("role") == "system":
+            if orig.get("content") != comp.get("content"):
+                logger.warning(
+                    "router.headroom: system message altered during compression; "
+                    "falling back to original"
+                )
+                return False
+
+        # Tool result messages must still have tool_call_id
+        if orig.get("role") == "tool":
+            if not comp.get("tool_call_id"):
+                logger.warning(
+                    "router.headroom: tool message lost tool_call_id during compression; "
+                    "falling back to original"
+                )
+                return False
+
+    return True
 
 
 def _normalize_output(
@@ -290,24 +313,21 @@ def _compress(
     messages: list[dict[str, Any]],
     model_name: str,
     policy_entry: dict[str, Any],
-    headroom_query: str | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, list[str]]:
     if _headroom_compress is None:
         raise RuntimeError(
             "HEADROOM_ENABLED=1 but the headroom compression API is unavailable"
         )
 
-    compress_kwargs: dict[str, Any] = {"model": model_name}
-    
-    if headroom_query is not None:
-        compress_kwargs["headroom_query"] = headroom_query
-    
     # Preserve original tool arguments before compression to prevent corruption
     messages_for_compression, preserved_tool_args = _preserve_tool_arguments(messages)
     
     try:
-        # Call headroom.compress() with valid parameters only
-        result = _headroom_compress(messages_for_compression, **compress_kwargs)
+        result = _headroom_compress(
+            messages_for_compression,
+            model=model_name,
+            config=_HEADROOM_CONFIG,  # Pass explicit config instead of kwargs
+        )
         
         normalized_compressed = _normalize_output(result, messages_for_compression)
         
@@ -326,14 +346,21 @@ def _compress(
         transforms = list(getattr(result, "transforms_applied", []) or [])
         
         logger.info(
-            "router.headroom: compression model=%s before=%s after=%s transforms=%s query=%s",
+            "router.headroom: compression model=%s before=%s after=%s transforms=%s",
             model_name,
             tokens_before or "unknown",
             tokens_after or "unknown",
             transforms,
-            headroom_query[:50] if headroom_query else "none",
         )
         
+        # Post-compression validation guard
+        if not _validate_tool_integrity(messages_for_compression, deserialized_messages):
+            logger.warning(
+                "router.headroom: tool_calls integrity check FAILED; "
+                "falling back to original uncompressed messages"
+            )
+            return messages, tokens_before, tokens_before, ["integrity_guard:fallback"]
+
         return deserialized_messages, tokens_before, tokens_after, transforms
     except TypeError as e:
         logger.warning("router.headroom: TypeError in compress, retrying with minimal params: %s", e)
@@ -382,15 +409,6 @@ def check_and_trim(
             tokens_after=initial_tokens,
         )
 
-    # Extract query for relevance scoring if enabled
-    headroom_query = None
-    if os.getenv("HEADROOM_RELEVANCE_ENABLED", "1").lower() not in {"0", "false", "off", "no"}:
-        headroom_query = _extract_query(messages)
-        if headroom_query:
-            logger.debug("router.headroom: extracted query for relevance scoring: %s", headroom_query[:50])
-        else:
-            logger.debug("router.headroom: no query extracted, skipping relevance scoring")
-
     # DIAGNOSTIC LOGGING START
     logger.info(f"HEADROOM_CHECK_AND_TRIM_START model={model_name} message_count={len(messages)}")
     # DIAGNOSTIC LOGGING END
@@ -399,7 +417,6 @@ def check_and_trim(
         messages,
         model_name,
         policy_entry,
-        headroom_query=headroom_query,
     )
     final_tokens = _token_count(compressed, model_name)
     rejected = final_tokens > budget

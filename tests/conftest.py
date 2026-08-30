@@ -126,18 +126,6 @@ def patch_headroom_enabled():
     return mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}, clear=True)
 
 
-@pytest.fixture
-def patch_relevance_disabled():
-    """Patch HEADROOM_RELEVANCE_ENABLED to disable relevance scoring."""
-    return mock.patch.dict(os.environ, {"HEADROOM_RELEVANCE_ENABLED": "0"}, clear=True)
-
-
-@pytest.fixture
-def patch_relevance_enabled():
-    """Patch HEADROOM_RELEVANCE_ENABLED to enable relevance scoring."""
-    return mock.patch.dict(os.environ, {"HEADROOM_RELEVANCE_ENABLED": "1"}, clear=True)
-
-
 # =============================================================================
 # Pytest Markers Configuration
 # =============================================================================
@@ -154,9 +142,6 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers", "code: Tests for code compression ([code] extra with tree-sitter)"
-    )
-    config.addinivalue_line(
-        "markers", "relevance: Tests for relevance scoring ([relevance] extra with fastembed)"
     )
     config.addinivalue_line(
         "markers", "compression: Tests for compression pipeline functionality"

@@ -36,16 +36,15 @@ docker run --rm llmrouter-audit python3 -m pytest tests/test_tokenizer.py -v
 
 | Marker | Description | Count |
 |--------|-------------|-------|
-| `base` | Base compression | 31 |
+| `base` | Base compression + config/validation | 45 |
 | `code` | Code compression | 12 |
-| `relevance` | Relevance scoring | 11 |
 | `tokenizer` | Token counting | 19 |
 | `policy` | Think policy | 35 |
 | `retrieval` | Qdrant retrieval | 15 |
 | `embeddings` | Embedding endpoints | 14 |
 | `streaming` | SSE streaming | 23 |
 | `usage` | Usage tracking | 17 |
-| `integration` | Real headroom tests | 11 |
+| `integration` | Real headroom tests | 10 |
 
 ## Files
 

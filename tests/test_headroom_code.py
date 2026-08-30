@@ -18,7 +18,7 @@ class TestCodeCompressionConfig:
 
     @pytest.mark.compression
     def test_code_compression_uses_valid_api_params(self, patch_headroom_compress, patch_token_count):
-        """Test code compression uses only valid API parameters (model, headroom_query)."""
+        """Test code compression uses only valid API parameters (model and config)."""
         compressed_messages = [{"role": "user", "content": "code"}]
         compressed = SimpleNamespace(
             messages=compressed_messages,
@@ -30,7 +30,6 @@ class TestCodeCompressionConfig:
         with (
             patch_headroom_compress(compressed) as call,
             patch_token_count(side_effect=[100, 50]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -56,7 +55,6 @@ class TestCodeCompressionConfig:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[200, 80]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -84,7 +82,6 @@ class TestCodeCompressionEdgeCases:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[10, 10]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -105,7 +102,6 @@ class TestCodeCompressionEdgeCases:
         with (
             patch_headroom_compress_dict(compressed),
             patch_token_count(side_effect=[100, 50]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -125,7 +121,6 @@ class TestCodeCompressionErrorHandling:
         with (
             mock.patch.object(headroom, "_headroom_compress", None),
             patch_token_count(return_value=10),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
             pytest.raises(RuntimeError, match="compression API is unavailable"),
         ):
             headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
@@ -144,7 +139,6 @@ class TestCodeCompressionErrorHandling:
         with (
             mock.patch.object(headroom, "_headroom_compress") as mock_compress,
             patch_token_count(side_effect=[10, 5]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             # First call raises TypeError, second succeeds
             mock_compress.side_effect = [TypeError("old API"), compressed]
@@ -163,7 +157,6 @@ class TestCodeCompressionErrorHandling:
         with (
             mock.patch.object(headroom, "_headroom_compress", side_effect=ValueError("network error")),
             patch_token_count(return_value=10),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
             pytest.raises(RuntimeError, match="Headroom compression failed"),
         ):
             headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
@@ -174,7 +167,6 @@ class TestCodeCompressionErrorHandling:
         with (
             mock.patch.object(headroom, "_headroom_compress") as mock_compress,
             patch_token_count(return_value=10),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             mock_compress.side_effect = [TypeError("old API"), ValueError("fallback error")]
 
@@ -194,7 +186,6 @@ class TestCodeCompressionBudget:
         with (
             patch_headroom_compress(compressed_messages),
             patch_token_count(side_effect=[900, 850]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -209,7 +200,6 @@ class TestCodeCompressionBudget:
         with (
             patch_headroom_compress(compressed_messages),
             patch_token_count(side_effect=[900, 700]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -226,8 +216,9 @@ class TestCodeCompressionIntegration:
     @pytest.mark.integration
     def test_code_compression_full_pipeline(self, patch_headroom_compress, patch_token_count):
         """Test full code compression pipeline end-to-end."""
+        # Compressed messages must have SAME system content to pass integrity validation
         compressed_messages = [
-            {"role": "system", "content": "You are helpful."},
+            {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "What is AI?"},
             {"role": "assistant", "content": "AI is..."},
         ]
@@ -241,7 +232,6 @@ class TestCodeCompressionIntegration:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[150, 80]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(
                 [

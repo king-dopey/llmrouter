@@ -12,7 +12,9 @@ Comprehensive pytest suite for the OpenAI-Compatible Router Node for Ollama LLM.
 
 ## Overview
 
-The project uses **pytest** (v7.4+) for unit testing with a comprehensive suite of **207 tests** covering all core modules.
+The project uses **pytest** (v7.4+) for unit testing with a comprehensive suite of **260+ tests** covering all core modules.
+
+> **Note:** New tests for `_HEADROOM_CONFIG` and `_validate_tool_integrity()` are included in the `base` marker category (29 base + 16 config/validation = 45 total).
 
 **Important:** Tests must be run inside the Docker container. Running tests on the host system will fail because `headroom-ai` and its dependencies (PyTorch, transformers, etc.) require a specific environment that is only available in the container.
 
@@ -30,7 +32,8 @@ docker build --target audit -t llmrouter-audit .
 ```
 
 The audit target:
-1. Installs all dependencies from [`requirements.txt`](requirements.txt) including `headroom-ai[code,relevance]`
+
+1. Installs all dependencies from [`requirements.txt`](requirements.txt) including `headroom-ai[code]` (relevance extras removed in Story 1)
 2. Copies all test files
 3. Runs `python3 -m pytest tests/ -v`
 
@@ -45,10 +48,11 @@ RuntimeError: headroom library is not installed. Integration tests require headr
 ```
 
 The host system typically lacks:
+
 - PyTorch with correct CUDA/CPU configuration
 - transformers library
 - sentence-transformers
-- headroom-ai with [code,relevance] extras
+- headroom-ai with [code] extras (relevance extras removed in Story 1)
 
 ### Running Specific Tests in Docker
 
@@ -73,10 +77,10 @@ docker run --rm llmrouter-audit python3 -m pytest tests/ --cov=app --cov=router_
 ```
 tests/
 ├── conftest.py                    # Shared fixtures for headroom compression
-├── test_headroom_base.py          # Base compression (31 tests)
+├── test_headroom_base.py          # Base compression (29 tests)
 ├── test_headroom_code.py          # Code compression (12 tests)
-├── test_headroom_relevance.py     # Relevance scoring (11 tests)
-├── test_headroom_integration.py   # Integration tests with real headroom (11 tests)
+├── test_headroom_config_validation.py  # Config & integrity validation (16 tests)
+├── test_headroom_integration.py   # Integration tests with real headroom (10 tests)
 ├── test_tokenizer.py              # Token counting (19 tests)
 ├── test_think_policy.py           # Think policy evaluation (35 tests)
 ├── test_retrieval.py              # Qdrant retrieval (15 tests)
@@ -106,36 +110,43 @@ The [`tests/conftest.py`](tests/conftest.py) module provides centralized fixture
 | `patch_token_count()` | Patch tokenizer count with configurable side effects |
 | `patch_headroom_disabled()` | Disable HEADROOM_ENABLED via environment |
 | `patch_headroom_enabled()` | Enable HEADROOM_ENABLED via environment |
-| `patch_relevance_disabled()` | Disable HEADROOM_RELEVANCE_ENABLED via environment |
-| `patch_relevance_enabled()` | Enable HEADROOM_RELEVANCE_ENABLED via environment |
 
 ## Test Categories
 
-### Headroom Compression Tests (54 tests)
+### Headroom Compression Tests (57 tests)
 
 Tests for the headroom-ai inline compression layer.
 
 | Marker | Description | File | Count |
 |--------|-------------|------|-------|
-| `base` | Base compression without extras | `test_headroom_base.py` | 31 |
+| `base` | Base compression without extras | `test_headroom_base.py` | 29 |
 | `code` | Code compression with tree-sitter | `test_headroom_code.py` | 12 |
-| `relevance` | Relevance scoring with fastembed | `test_headroom_relevance.py` | 11 |
 
 **Coverage:**
 - `check_and_trim()` function with all output types (CompressResult, dict, plain list)
-- `_compress()` with policy options (compress_user_messages, target_ratio, relevance_threshold)
+- `_compress()` with explicit `config=_HEADROOM_CONFIG` parameter (system messages protected from compression)
 - Budget enforcement (reserved_output_tokens, safety_headroom_tokens)
-- Configuration flags (HEADROOM_ENABLED, HEADROOM_RELEVANCE_ENABLED)
+- Configuration flags (HEADROOM_ENABLED only — HEADROOM_RELEVANCE_ENABLED removed in Story 1)
 - Error handling (missing dependency, TypeError fallback, general exceptions)
 - Telemetry extraction (tokens_before, tokens_after, transforms_applied)
 
-### Integration Tests (11 tests)
+### Config & Integrity Validation Tests (16 tests)
+
+Tests for `_HEADROOM_CONFIG` singleton and `_validate_tool_integrity()` function added in Story 1.
+
+| Test Class | Description | Count |
+|------------|-------------|-------|
+| `TestHeadroomConfig` | Verifies `_HEADROOM_CONFIG` module-level singleton with correct values | 4 |
+| `TestValidateToolIntegrity` | Tests integrity validation logic (length mismatch, tool_calls parity, system message alteration, tool_call_id loss) | 8 |
+| `TestIntegrityFallbackPath` | Tests fallback to original messages when validation fails in `_compress()` | 4 |
+
+### Integration Tests (10 tests)
 
 Tests with the real headroom library (not mocked) to verify the API contract.
 
 | Marker | Description | File | Count |
 |--------|-------------|------|-------|
-| `integration` | End-to-end pipeline tests | `test_headroom_integration.py` | 11 |
+| `integration` | End-to-end pipeline tests | `test_headroom_integration.py` | 10 |
 
 **Note:** These tests require headroom-ai to be installed and will fail at collection time if not available.
 
@@ -291,6 +302,7 @@ If you see `PytestUnknownMarkWarning: Unknown pytest.mark.<name>`, ensure the ma
 ### Import Errors
 
 If tests fail with `ImportError: cannot import name ...`, verify that:
+
 1. The module path is correct relative to the test file
 2. Dependencies are installed (`pip install -r requirements.txt`)
 3. The `sys.path` includes the project root (handled by `ROUTER_DIR` in test files)
@@ -298,6 +310,7 @@ If tests fail with `ImportError: cannot import name ...`, verify that:
 ### Fixture Not Found
 
 If a fixture is not found, verify:
+
 1. The fixture is defined in `conftest.py` or the test file itself
 2. The fixture scope matches the test requirements (function, class, module, session)
 3. No circular imports are preventing fixture loading

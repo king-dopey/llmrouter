@@ -88,10 +88,12 @@ The router provides:
 | [`tests/test_app.py`](../tests/test_app.py) | Core application logic and request handling | `integration` | 9 |
 | [`tests/test_chat_completions_integration.py`](../tests/test_chat_completions_integration.py) | Chat completion flow end-to-end (mocked) | `integration` | 5 |
 | [`tests/test_embeddings_endpoint.py`](../tests/test_embeddings_endpoint.py) | Embeddings API endpoint | `embeddings` | 4 |
-| [`tests/test_headroom_base.py`](../tests/test_headroom_base.py) | Base compression tests | `base`, `compression`, `error_handling` | 31 |
+| [`tests/test_headroom_base.py`](../tests/test_headroom_base.py) | Base compression tests | `base`, `compression`, `error_handling` | 29 |
 | [`tests/test_headroom_code.py`](../tests/test_headroom_code.py) | Code compression with tree-sitter | `code`, `compression` | 12 |
-| [`tests/test_headroom_integration.py`](../tests/test_headroom_integration.py) | Integration tests with real headroom | `integration` | 11 |
-| [`tests/test_headroom_relevance.py`](../tests/test_headroom_relevance.py) | Relevance scoring with fastembed | `relevance`, `compression` | 11 |
+| [`tests/test_headroom_config_validation.py`](../tests/test_headroom_config_validation.py) | Config & integrity validation (Story 1) | `base` | 16 |
+| [`tests/test_headroom_integration.py`](../tests/test_headroom_integration.py) | Integration tests with real headroom | `integration` | 10 |
+
+**Note:** `test_headroom_relevance.py` was deleted in Story 1 as relevance scoring functionality was deprecated. The `relevance` marker was removed from pytest configuration.
 | [`tests/test_nonstream_usage.py`](../tests/test_nonstream_usage.py) | Non-streaming response usage tracking | `usage` | 2 |
 | [`tests/test_orin_policy.py`](../tests/test_orin_policy.py) | Orin profile policy tests | `policy` | — |
 | [`tests/test_policy.py`](../tests/test_policy.py) | Think policy engine (unittest) | `policy` | 7 |
@@ -154,11 +156,12 @@ These variables are loaded via Docker Compose `env_file` directive for the route
 | `MODEL_PULL_MAX_RETRIES` | `2` | Retry count for pull operations |
 | `MODEL_PULL_BACKOFF_SEC` | `5` | Backoff delay between retries (seconds) |
 | `HEADROOM_ENABLED` | `1` | Enable headroom-ai compression (`0` to disable) |
-| `HEADROOM_RELEVANCE_ENABLED` | `1` | Enable relevance scoring (`0` to disable) |
 | `HF_HOME` | `/data/hf_cache` | Hugging Face home directory for kompress-v2-base ONNX model |
 | `HUGGINGFACE_HUB_CACHE` | `/data/hf_cache/hub` | Hugging Face hub cache |
 | `TRANSFORMERS_CACHE` | `/data/hf_cache/models` | Transformers model cache |
 | `HEADROOM_CCR_STORE_PATH` | `/data/headroom_ccr` | Headroom CCR store path |
+
+**Note:** `HEADROOM_RELEVANCE_ENABLED` was removed in Story 1 as relevance scoring functionality was deprecated.
 
 ### Qdrant Runtime Variables (`profiles/qdrant.env`)
 
@@ -246,8 +249,8 @@ The router uses [headroom-ai](https://github.com/headroomlabs-ai/headroom) as an
 
 1. Router injects optional retrieval context from Qdrant
 2. Constructs complete Ollama payload
-3. Calls `headroom.compress(messages, model=..., headroom_query=...)` once on finalized message list
-4. Extracts user's query from last user message as `headroom_query` for relevance scoring (when enabled)
+3. Calls `headroom.compress(messages, model=..., config=_HEADROOM_CONFIG)` once on finalized message list with explicit `CompressConfig` (`compress_system_messages=False`)
+4. Validates tool_calls integrity via `_validate_tool_integrity()` after compression; falls back to original messages if validation fails
 5. Checks compressed prompt against configured context window with reserved output and safety tokens
 6. Rejects if compressed prompt still cannot fit (no silent history discard)
 
@@ -256,9 +259,9 @@ The router uses [headroom-ai](https://github.com/headroomlabs-ai/headroom) as an
 The router calls `headroom.compress()` with:
 - `messages`: Finalized message list (required)
 - `model`: Model name for token counting (required)
-- `headroom_query`: User's query for relevance scoring (optional, extracted from last user message)
+- `config`: Explicit `CompressConfig` singleton with `compress_system_messages=False`, `compress_user_messages=False`, `protect_recent=4`
 
-**Note:** The router does not pass invalid parameters such as `compress_user_messages`, `target_ratio`, `protect_recent`, or `relevance_threshold`. These are not part of the headroom.compress() API contract.
+**Note:** The router does not pass invalid parameters such as `headroom_query`, `target_ratio`, or `relevance_threshold`. These are not part of the headroom.compress() API contract.
 
 ### Policy Configuration
 
@@ -293,7 +296,9 @@ python3 ingest_repo.py --path /path/to/repo --collection repo_chunks
 
 ## Testing
 
-The project includes a comprehensive pytest test suite with **207 tests** covering all core modules.
+The project includes a comprehensive pytest test suite with **260+ tests** covering all core modules including headroom-ai compression (with config validation), tokenization, think policy evaluation, Qdrant retrieval, embeddings, streaming, and usage tracking.
+
+> **Note:** The `relevance` marker was removed in Story 1 as relevance scoring functionality was deprecated. New tests for `_HEADROOM_CONFIG` and `_validate_tool_integrity()` are included in the `base` marker category (29 base + 16 config/validation = 45 total).
 
 > **Important:** Tests must run inside the Docker container. Running tests on the host will fail because `headroom-ai` and its ML dependencies (PyTorch, transformers, etc.) are only available in the container environment. See [TESTING.md](TESTING.md) for details.
 
@@ -319,16 +324,17 @@ docker run --rm llmrouter-audit python3 -m pytest tests/test_tokenizer.py -v
 
 | Marker | Description | Count |
 |--------|-------------|-------|
-| `base` | Base compression (headroom-ai without extras) | 31 |
+| `base` | Base compression + config/validation | 45 |
 | `code` | Code compression with tree-sitter | 12 |
-| `relevance` | Relevance scoring with fastembed | 11 |
 | `tokenizer` | Token counting and estimation | 19 |
 | `policy` | Think policy configuration | 35 |
 | `retrieval` | Qdrant context retrieval | 15 |
 | `embeddings` | Embedding generation endpoints | 14 |
 | `streaming` | SSE streaming and tool calls | 23 |
 | `usage` | Usage tracking in responses | 17 |
-| `integration` | End-to-end pipeline tests | 11 |
+| `integration` | End-to-end pipeline tests with real headroom | 10 |
+
+**Note:** The `relevance` marker was removed in Story 1 as relevance scoring functionality was deprecated. New tests for `_HEADROOM_CONFIG` and `_validate_tool_integrity()` are included in the `base` marker category (29 base + 16 config/validation = 45 total).
 
 ### Validation Scripts
 

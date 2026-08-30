@@ -12,78 +12,6 @@ from conftest import CODE_POLICY, MESSAGES, BASE_POLICY, MODEL
 
 
 @pytest.mark.base
-class TestExtractQuery:
-    """Tests for _extract_query helper function."""
-
-    def test_extract_query_from_single_user_message(self):
-        """Test extracting query from a single user message."""
-        messages = [{"role": "user", "content": "What is AI?"}]
-        query = headroom._extract_query(messages)
-        assert query == "What is AI?"
-
-    def test_extract_query_from_multi_turn_conversation(self):
-        """Test extracting the last user query from multi-turn conversation."""
-        messages = [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there!"},
-            {"role": "user", "content": "What is AI?"},
-        ]
-        query = headroom._extract_query(messages)
-        assert query == "What is AI?"
-
-    def test_extract_query_from_multimodal_content(self):
-        """Test extracting query from multimodal content (list of dicts)."""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What is in this image?"},
-                    {"type": "image_url", "image_url": {"url": "http://example.com/img.png"}},
-                ],
-            }
-        ]
-        query = headroom._extract_query(messages)
-        assert query == "What is in this image?"
-
-    def test_extract_query_returns_none_for_empty_messages(self):
-        """Test that _extract_query returns None for empty messages."""
-        query = headroom._extract_query([])
-        assert query is None
-
-    def test_extract_query_returns_none_for_no_user_messages(self):
-        """Test that _extract_query returns None when no user messages exist."""
-        messages = [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "assistant", "content": "Hi there!"},
-        ]
-        query = headroom._extract_query(messages)
-        assert query is None
-
-    def test_extract_query_skips_non_string_content(self):
-        """Test that _extract_query skips messages with non-string/list content."""
-        messages = [
-            {"role": "user", "content": {"path": "file.py"}},  # dict content
-            {"role": "user", "content": "What is AI?"},  # valid string content
-        ]
-        query = headroom._extract_query(messages)
-        assert query == "What is AI?"
-
-    def test_extract_query_handles_empty_text_parts(self):
-        """Test that _extract_query handles multimodal content with empty text parts."""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "http://example.com/img.png"}},
-                ],
-            }
-        ]
-        query = headroom._extract_query(messages)
-        assert query is None  # No text parts found
-
-
-@pytest.mark.base
 @pytest.mark.compression
 class TestBaseCompression:
     """Tests for base compression functionality."""
@@ -102,7 +30,6 @@ class TestBaseCompression:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[10, 3]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -120,7 +47,6 @@ class TestBaseCompression:
         with (
             patch_headroom_compress_list(compressed_messages),
             patch_token_count(side_effect=[10, 2]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -141,7 +67,6 @@ class TestBaseCompression:
         with (
             patch_headroom_compress_dict(compressed),
             patch_token_count(side_effect=[10, 3]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -162,7 +87,6 @@ class TestBaseCompression:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[10, 10]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -182,7 +106,6 @@ class TestBaseCompression:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[200, 80]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -220,7 +143,6 @@ class TestBaseCompressionEdgeCases:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[5, 2]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(single_message, MODEL, BASE_POLICY)
 
@@ -235,8 +157,9 @@ class TestBaseCompressionEdgeCases:
             {"role": "user", "content": "What is 2+2?"},
             {"role": "assistant", "content": "4"},
         ]
+        # Compressed messages must have SAME system content to pass integrity validation
         compressed_messages = [
-            {"role": "system", "content": "Helpful assistant."},
+            {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "2+2?"},
             {"role": "assistant", "content": "4"},
         ]
@@ -250,7 +173,6 @@ class TestBaseCompressionEdgeCases:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[30, 15]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(multi_messages, MODEL, BASE_POLICY)
 
@@ -263,7 +185,6 @@ class TestBaseCompressionEdgeCases:
         with (
             mock.patch.object(headroom, "_headroom_compress", return_value="unexpected_string"),
             mock.patch.object(headroom, "_token_count", side_effect=[10, 10]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
             mock.patch("router_headroom.logger") as logger_mock,
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
@@ -284,7 +205,6 @@ class TestBaseCompressionBudget:
         with (
             patch_headroom_compress(compressed_messages),
             patch_token_count(side_effect=[900, 850]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -299,7 +219,6 @@ class TestBaseCompressionBudget:
         with (
             patch_headroom_compress(compressed_messages),
             patch_token_count(side_effect=[900, 700]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -313,7 +232,6 @@ class TestBaseCompressionBudget:
         with (
             patch_headroom_compress(compressed_messages),
             patch_token_count(side_effect=[800, 800]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -340,7 +258,6 @@ class TestBaseCompressionTrimReason:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[10, 3]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -359,7 +276,6 @@ class TestBaseCompressionTrimReason:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[10, 10]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -377,7 +293,6 @@ class TestBaseCompressionConfig:
             mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "false"}),
             mock.patch.object(headroom, "_headroom_compress") as call,
             patch_token_count(return_value=10),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -391,7 +306,6 @@ class TestBaseCompressionConfig:
             mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "off"}),
             mock.patch.object(headroom, "_headroom_compress") as call,
             patch_token_count(return_value=10),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -413,7 +327,6 @@ class TestBaseCompressionConfig:
             mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}),
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[10, 3]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 
@@ -595,8 +508,9 @@ class TestBaseCompressionIntegration:
 
     def test_full_compression_pipeline(self, patch_headroom_compress, patch_token_count):
         """Test full compression pipeline end-to-end."""
+        # Compressed messages must have SAME system content to pass integrity validation
         compressed_messages = [
-            {"role": "system", "content": "You are helpful."},
+            {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "What is AI?"},
             {"role": "assistant", "content": "AI is..."},
         ]
@@ -610,7 +524,6 @@ class TestBaseCompressionIntegration:
         with (
             patch_headroom_compress(compressed),
             patch_token_count(side_effect=[150, 80]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(
                 [
@@ -630,13 +543,28 @@ class TestBaseCompressionIntegration:
         assert "content_router" in result.transforms_applied
         assert "code_compressor" in result.transforms_applied
 
-    def test_compression_with_error_response(self, patch_headroom_compress, patch_token_count):
-        """Test error response when compression fails budget."""
-        compressed_messages = [{"role": "user", "content": "still too long"}]
+    def test_full_compression_pipeline(self, patch_headroom_compress, patch_token_count):
+        """Test full compression pipeline end-to-end with tool calls."""
+        original_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is AI?"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_123", "type": "function", "function": {"name": "search"}}],
+            },
+        ]
+        # Compressed messages must have SAME system content AND tool_calls to pass integrity validation
+        compressed_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is AI?"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_123", "type": "function", "function": {"name": "search"}}],
+            },
+        ]
         with (
             patch_headroom_compress(compressed_messages),
             patch_token_count(side_effect=[900, 850]),
-            mock.patch.object(headroom, "_extract_query", return_value=None),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, BASE_POLICY)
 

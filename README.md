@@ -537,15 +537,15 @@ Router policy defaults by profile:
 
 ## Headroom-AI Context Management
 
-The router uses the public Python library API from [headroom-ai](https://github.com/headroomlabs-ai/headroom) as an inline compression layer before forwarding a finalized request to Ollama. The image installs the latest `headroom-ai[code,relevance]` feature set: core content routing, AST-aware code compression, and semantic relevance scoring.
+The router uses the public Python library API from [headroom-ai](https://github.com/headroomlabs-ai/headroom) as an inline compression layer before forwarding a finalized request to Ollama. The image installs `headroom-ai[code]` for core content routing and AST-aware code compression.
 
 ### How It Works
 
-When enabled, the router injects optional retrieval context, constructs the complete Ollama payload, and calls `headroom.compress(messages, model=..., headroom_query=...)` once on the finalized message list. The router extracts the user's query from the last user message and passes it as `headroom_query` for semantic relevance scoring when enabled.
+When enabled, the router injects optional retrieval context, constructs the complete Ollama payload, and calls `headroom.compress(messages, model=..., config=_HEADROOM_CONFIG)` once on the finalized message list. The `_HEADROOM_CONFIG` singleton is configured with `compress_system_messages=False` to preserve Zoo Code's tool definitions, usage instructions, and protocol from being compressed.
 
 Headroom selects supported transforms internally based on content type (JSON, code, text, etc.). The router does not split history, drop turns, implement its own cache alignment, or maintain a separate compression store.
 
-After compression, the router checks the compressed prompt against the configured model context window while reserving output and safety tokens. A compressed prompt that still cannot fit is rejected rather than silently discarding conversation history.
+After compression, the router validates that tool_calls structure survived intact via `_validate_tool_integrity()`. If validation fails, the router falls back to original uncompressed messages with a warning log. A compressed prompt that still cannot fit is rejected rather than silently discarding conversation history.
 
 ### API Contract
 
@@ -553,9 +553,7 @@ The router calls `headroom.compress()` with the following parameters:
 
 - `messages`: The finalized message list (required)
 - `model`: The model name for token counting (required)
-- `headroom_query`: The user's query for relevance scoring (optional, extracted from last user message)
-
-**Note:** The router does not pass invalid parameters such as `compress_user_messages`, `target_ratio`, `protect_recent`, or `relevance_threshold`. These are not part of the headroom.compress() API contract.
+- `config`: Explicit `CompressConfig` singleton with `compress_system_messages=False`, `compress_user_messages=False`, `protect_recent=4`
 
 ### Policy Configuration
 
@@ -573,7 +571,6 @@ The router does not expose Headroom MCP tools, proxy routes, custom CCR retrieva
 | Variable | Default | Description |
 | --- | --- | --- |
 | `HEADROOM_ENABLED` | `1` | Set to `0`, `false`, `off`, or `no` to disable headroom compression entirely |
-| `HEADROOM_RELEVANCE_ENABLED` | `1` | Set to `0`, `false`, `off`, or `no` to disable semantic relevance scoring |
 
 ### Disabling Headroom
 
@@ -584,16 +581,6 @@ HEADROOM_ENABLED=0 docker compose up -d
 ```
 
 When disabled explicitly, requests proceed without Headroom compression. When enabled but the compression API is unavailable, the router returns an error instead of silently forwarding uncompressed input.
-
-### Disabling Relevance Scoring
-
-To disable semantic relevance scoring while keeping compression enabled:
-
-```bash
-HEADROOM_RELEVANCE_ENABLED=0 docker compose up -d
-```
-
-When relevance scoring is disabled, the router does not extract or pass `headroom_query` to the compression function. This may reduce compression quality for tool-heavy conversations but eliminates the overhead of semantic similarity calculations.
 
 ## GPU Acceleration Support
 
@@ -648,7 +635,7 @@ This behavior eliminates transient failures during model warm-up and improves re
 
 ## Testing
 
-The project includes a comprehensive pytest test suite with **207 tests** covering all core modules including headroom-ai compression, tokenization, think policy evaluation, Qdrant retrieval, embeddings, streaming, and usage tracking.
+The project includes a comprehensive pytest test suite with **260+ tests** covering all core modules including headroom-ai compression (with config validation), tokenization, think policy evaluation, Qdrant retrieval, embeddings, streaming, and usage tracking.
 
 > **Important:** Tests must run inside the Docker container. Running tests on the host will fail because `headroom-ai` and its ML dependencies (PyTorch, transformers, etc.) are only available in the container environment. See [TESTING.md](TESTING.md) for details.
 
@@ -674,16 +661,15 @@ docker run --rm llmrouter-audit python3 -m pytest tests/test_tokenizer.py -v
 
 | Marker | Description | Count |
 |--------|-------------|-------|
-| `base` | Base compression | 31 |
+| `base` | Base compression + config/validation | 45 |
 | `code` | Code compression | 12 |
-| `relevance` | Relevance scoring | 11 |
 | `tokenizer` | Token counting | 19 |
 | `policy` | Think policy | 35 |
 | `retrieval` | Qdrant retrieval | 15 |
 | `embeddings` | Embedding endpoints | 14 |
 | `streaming` | SSE streaming | 23 |
 | `usage` | Usage tracking | 17 |
-| `integration` | Real headroom tests | 11 |
+| `integration` | Real headroom tests | 10 |
 
 ### Full Documentation
 

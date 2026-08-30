@@ -32,7 +32,7 @@ class TestHeadroomIntegration:
             {"role": "user", "content": "What is AI?"},
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "0"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         assert result.rejected is False
@@ -45,19 +45,19 @@ class TestHeadroomIntegration:
             {"role": "user", "content": "Explain machine learning."},
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "0"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         assert result.rejected is False
         assert result.messages is not None
 
-    def test_compression_with_headroom_query_for_relevance(self):
-        """Test compression with headroom_query for relevance scoring."""
+    def test_compression_with_tool_calls_preserved(self):
+        """Test compression preserves tool call structure."""
         messages = [
             {"role": "user", "content": "What is deep learning?"},
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "1"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         assert result.rejected is False
@@ -75,7 +75,7 @@ class TestHeadroomIntegration:
             }
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "1"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         assert result.rejected is False
@@ -103,7 +103,7 @@ class TestHeadroomIntegration:
             },
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "0"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         assert result.rejected is False
@@ -127,7 +127,7 @@ class TestHeadroomIntegration:
             {"role": "assistant", "content": "How can I help you?"},
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "1"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         assert result.rejected is False
@@ -140,7 +140,7 @@ class TestHeadroomIntegration:
             {"role": "assistant", "content": {"path": "file.py", "mode": "read"}},
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "1"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         assert result.rejected is False
@@ -153,7 +153,7 @@ class TestHeadroomIntegration:
             {"role": "assistant", "content": ["item1", "item2", "item3"]},
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "1"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         assert result.rejected is False
@@ -180,7 +180,7 @@ class TestHeadroomIntegration:
             {"role": "user", "content": large_content},
         ]
         
-        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1", "HEADROOM_RELEVANCE_ENABLED": "0"}):
+        with mock.patch.dict(os.environ, {"HEADROOM_ENABLED": "1"}):
             result = headroom.check_and_trim(messages, MODEL, BASE_POLICY)
         
         # Should either compress successfully or reject if still too large
