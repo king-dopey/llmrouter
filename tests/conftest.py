@@ -22,6 +22,7 @@ BASE_POLICY = {
     "options": {"num_ctx": 1000},
     "reserved_output_tokens": 100,
     "safety_headroom_tokens": 100,
+    "recovery_strategy": "",
 }
 CODE_POLICY = {
     "options": {
@@ -31,8 +32,34 @@ CODE_POLICY = {
     },
     "reserved_output_tokens": 100,
     "safety_headroom_tokens": 100,
+    "recovery_strategy": "",
 }
+
 MESSAGES = [{"role": "user", "content": "hello"}]
+
+# Policy with drop_oldest strategy for recovery tests
+DROP_OLDEST_POLICY = {
+    "options": {"num_ctx": 1000},
+    "reserved_output_tokens": 100,
+    "safety_headroom_tokens": 100,
+    "recovery_strategy": "drop_oldest",
+}
+
+# Policy with summarize_history strategy for recovery tests
+SUMMARIZE_POLICY = {
+    "options": {"num_ctx": 1000},
+    "reserved_output_tokens": 100,
+    "safety_headroom_tokens": 100,
+    "recovery_strategy": "summarize_history",
+}
+
+# Policy with high budget for tests that expect no rejection
+HIGH_BUDGET_POLICY = {
+    "options": {"num_ctx": 10000},
+    "reserved_output_tokens": 100,
+    "safety_headroom_tokens": 100,
+    "recovery_strategy": "",
+}
 
 
 # =============================================================================

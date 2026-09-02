@@ -1,73 +1,119 @@
-# Thor model policy
+# Thor 128 GB model policy
 #
-# This file is tuned for real-world local use on Thor after observing:
-#   - qwen3.8:27b-bf16 can deliver high quality, but may massively overrun
-#     wall-clock time on standard coding if reasoning is left unconstrained
-#   - laguna-xs-2.1 loops too often in this environment to remain a primary coder
-#   - qwen3.6:35b-a3b-q8_0 remains the best completion-time default
-#   - qwen3-embedding:8b is in constant use for code indexing/search
+# This file is tuned for real-world local use on Thor, where large-context coding,
+# planning, and multi-stage agent workflows are practical, but model choice still
+# strongly affects latency, loop risk, and cost.
 #
 # ---------------------------------------------------------------------------
-# Zoo Code routing guidance
+# Zoo Code mode routing guidance
 # ---------------------------------------------------------------------------
-# Default ladder:
-#   1) qwen3.6:35b-a3b-q8_0   -> default for standard coding/planning/debug/docs/review
-#   2) qwen3.8:27b-q8_0       -> escalation for hard coding/planning/repo reasoning
-#   3) qwen3.8:27b-bf16       -> explicit quality-first/manual escalation only
-#   4) granite4.1-guardian    -> security review gate
+# Recommended default mode mapping:
+#
+#   architect             -> qwen3.8:27b-bf16
+#   debug                 -> qwen3.8:27b-bf16
+#   code                  -> qwen3.6:35b-a3b-q8_0
+#   tester                -> qwen3.6:35b-a3b-q8_0
+#   reviewer              -> qwen3.6:35b-a3b-q8_0
+#   security-review       -> granite4.1-guardian:8b-q6_K
+#   documentation-writer  -> qwen3.6:35b-a3b-q8_0
+#
+# Why this mapping:
+#   - qwen3.6 is the best default balance for standard coding, planning, review,
+#     documentation, and normal agent-loop work.
+#   - qwen3.8:27b-bf16 is reserved for the two highest-cost reasoning roles:
+#       * architect: structural decomposition, plan quality, repo-wide reasoning
+#       * debug: failure diagnosis, root-cause isolation, ambiguous regressions
+#   - granite4.1-guardian is the preferred policy/security gate.
+#
+# Optional alternate recommendation:
+#   If debug latency becomes too high in live use, switch:
+#     debug -> qwen3.8:27b-q8_0
+#   and keep bf16 only for architect or explicit manual escalation.
+#   This usually preserves strong reasoning while reducing runtime cost.
+#
+# ---------------------------------------------------------------------------
+# Operational model priorities
+# ---------------------------------------------------------------------------
+# Primary default:
+#   qwen3.6:35b-a3b-q8_0
+#     - standard coding
+#     - implementation
+#     - routine planning
+#     - debugging follow-through
+#     - review
+#     - documentation
+#
+# High-reasoning escalation:
+#   qwen3.8:27b-q8_0
+#     - hard coding
+#     - difficult repo reasoning
+#     - cheaper/faster than bf16
+#
+# Quality-first escalation:
+#   qwen3.8:27b-bf16
+#     - architect
+#     - debug
+#     - important manual escalations
+#     - complex planning where latency is acceptable
 #
 # Supporting roles:
-#   - qwen3-coder-next        -> direct edit / non-thinking / parser-stable fallback
-#   - laguna-xs-2.1           -> experimental alternate only; demoted due to loop risk
-#   - qwen3-embedding:8b      -> always-hot code search / indexing
+#   qwen3-coder-next:q4_K_M   -> direct edit / parser-stable / low-overbuild fallback
+#   qwen3-embedding:8b        -> always-hot indexing / code search
+#   granite4.1-guardian:8b-q6_K -> security gate
+#
+# Experimental / fallback models:
+#   laguna-xs-2.1:q4_K_M      -> alternate only; high loop risk
+#   gemma4 / devstral / north-mini-code / gpt-oss / nemotron
+#                              retained as alternates, comparisons, or niche fallbacks
 #
 # ---------------------------------------------------------------------------
-# Operational notes
+# Context management policy
 # ---------------------------------------------------------------------------
-# Why qwen3.6 is primary again:
-#   qwen3.6:35b-a3b is a 35B-total / 3B-active MoE model.
-#   It is much cheaper per generated token than dense qwen3.8:27b.
-#   In practice, use qwen3.6 when bounded completion time matters.
+# This router uses Headroom as the primary context-management layer.
 #
-# Why qwen3.8:q8_0 is preferred over qwen3.8:bf16 for default escalation:
-#   - same underlying model family
-#   - q8_0 is much lighter and faster locally
-#   - bf16 is reserved for "important and hard" tasks, not routine loops
+# Rules:
+#   - baseline compression runs on every request
+#   - proactive summarization must trigger as late as safely possible
+#   - early summarization is considered a failure mode
+#   - dropping/segment stripping is absolute last-resort overflow recovery only
 #
+# Effective input budget:
+#   effective_input_budget = num_ctx - reserved_output_tokens - safety_headroom_tokens
+#
+# Threshold policy used here:
+#   - standard text/code/reasoning models:
+#       proactive threshold = effective_input_budget - max(1024, ceil(effective_input_budget * 0.02))
+#   - vision models:
+#       proactive threshold = effective_input_budget - ceil(effective_input_budget * 0.05)
+#   - embedding models:
+#       proactive summarization disabled
+#
+# For the currently tuned Thor values, this yields:
+#   qwen3.6:35b-a3b-q8_0   -> num_ctx 262144, threshold 240844
+#   qwen3.8:27b-q8_0       -> num_ctx 262144, threshold 240844
+#   qwen3.8:27b-bf16       -> num_ctx 262144, threshold 240844
+#   qwen3-coder-next       -> num_ctx 131072, threshold 120422
+#   laguna-xs-2.1          -> num_ctx 131072, threshold 120422
+#
+# Zoo Code interaction note:
+#   Zoo should use the true context windows defined in this policy (no inflation).
+#   When Zoo emits a condense trigger, the router intercepts that request and runs
+#   Headroom-based condensation/recovery so router policy remains authoritative.
+#
+# ---------------------------------------------------------------------------
+# Performance notes
+# ---------------------------------------------------------------------------
 # Rough practical planning multipliers relative to qwen3.6 baseline:
 #   qwen3.6:35b-a3b-q8_0      = 1.0x
 #   qwen3-coder-next:q4_K_M   = ~0.9x to 1.4x
-#   laguna-xs-2.1:q4_K_M      = ~1.0x to 2.0x (but high loop risk)
-#   qwen3.8:27b-q8_0          = ~4x to 8x task-time on standard agent loops
-#   qwen3.8:27b-bf16          = ~8x to 15x task-time on standard agent loops
-#   qwen3.8:27b-bf16 default-style runaway
-#                              = ~15x to 30x worst case if reasoning is not controlled
+#   laguna-xs-2.1:q4_K_M      = ~1.0x to 2.0x (high loop risk)
+#   qwen3.8:27b-q8_0          = ~4x to 8x task-time
+#   qwen3.8:27b-bf16          = ~8x to 15x task-time
+#   qwen3.8:27b-bf16 runaway  = ~15x to 30x worst case if reasoning is not bounded
 #
 # Important:
-#   This YAML can set safe local defaults, but it cannot fully express
-#   request-time reasoning controls used by OpenAI-compatible routers.
-#   For qwen3.8, the router should prefer LOWER/MEDIUM reasoning for normal work,
-#   and only enable high/deep reasoning explicitly.
-#
-# Recommended router-side profiles:
-#   qwen3.6 standard          -> default
-#   qwen3.6 deep              -> higher-complexity planning/review
-#   qwen3.8 q8 medium         -> hard planning / hard coding escalation
-#   qwen3.8 bf16 medium       -> explicit quality-first escalation
-#
-# Memory shape:
-#   always-hot:
-#     qwen3.6:35b-a3b-q8_0    ~39 GB
-#     qwen3-embedding:8b      ~4.7 GB
-#   static hot total          ~43.7 GB
-#
-# This leaves enough headroom for:
-#   - qwen3.8:q8_0 timed residency
-#   - large contexts on qwen3.6
-#   - embedding traffic
-#   - runtime buffers / KV cache / containers
-#
-# If you later choose to re-promote qwen3.8, prefer q8_0 before bf16 for automation.
+#   Thor can run the large models, but automation should still prefer qwen3.6 for
+#   normal flow and use qwen3.8 deliberately for reasoning-heavy roles.
 
 models:
   # Primary default model
@@ -82,11 +128,40 @@ models:
   - model: qwen3.6:35b-a3b-q8_0
     keep_alive: -1
     think: true
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
     warmup: true
+    reserved_output_tokens: 8192
+    safety_headroom_tokens: 8192
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 240844
+    recovery_strategy: summarize_history
     options:
       num_ctx: 262144
       num_batch: 384
       temperature: 0.18
+      top_p: 0.90
+      repeat_penalty: 1.03
+
+  # A/B candidate for Python/MCP implementation work
+  # Coding-specialized variant for comparison with qwen3.6:35b-a3b-q8_0
+  - model: qwen3.6:35b-a3b-coding
+    keep_alive: 15m
+    think: true
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
+    warmup: false
+    reserved_output_tokens: 8192
+    safety_headroom_tokens: 8192
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 240844
+    recovery_strategy: summarize_history
+    options:
+      num_ctx: 262144
+      num_batch: 320
+      temperature: 0.15
       top_p: 0.90
       repeat_penalty: 1.03
 
@@ -97,6 +172,10 @@ models:
     keep_alive: -1
     think: false
     warmup: true
+    reserved_output_tokens: 2048
+    safety_headroom_tokens: 2048
+    proactive_summarization_threshold_tokens: 0
+    recovery_strategy: drop_oldest
     options:
       num_ctx: 40960
       num_batch: 512
@@ -111,19 +190,25 @@ models:
   #   use as the main "hard task" upgrade over qwen3.6,
   #   but avoid making it the default for every coding loop.
   #
-  # Router-side recommendation:
   #   keep reasoning conservative/medium for most tasks.
   - model: qwen3.8:27b-q8_0
     keep_alive: 45m
     think: true
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
     warmup: false
+    reserved_output_tokens: 8192
+    safety_headroom_tokens: 8192
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 240844
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 262144
       num_batch: 320
       temperature: 0.15
       top_p: 0.90
       repeat_penalty: 1.03
-
   # Explicit quality-first model
   # Use only for:
   #   - hard manual escalations
@@ -135,7 +220,15 @@ models:
   - model: qwen3.8:27b-bf16
     keep_alive: 15m
     think: true
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
     warmup: false
+    reserved_output_tokens: 8192
+    safety_headroom_tokens: 8192
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 240844
+    recovery_strategy: summarize_history
     options:
       num_ctx: 262144
       num_batch: 192
@@ -153,7 +246,15 @@ models:
   - model: qwen3-coder-next:q4_K_M
     keep_alive: 30m
     think: false
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 256
@@ -168,6 +269,11 @@ models:
     keep_alive: 15m
     think: true
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 192
@@ -180,6 +286,11 @@ models:
     keep_alive: 20m
     think: true
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 256
@@ -192,6 +303,11 @@ models:
     keep_alive: 15m
     think: true
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 256
@@ -204,6 +320,11 @@ models:
     keep_alive: 15m
     think: true
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 256
@@ -217,6 +338,11 @@ models:
     keep_alive: 20m
     think: false
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 256
@@ -228,7 +354,13 @@ models:
   - model: qwen3:4b
     keep_alive: 30m
     think: true
+    tool_call_think: false
     warmup: false
+    reserved_output_tokens: 2048
+    safety_headroom_tokens: 2048
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 35840
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 40960
       num_batch: 512
@@ -240,7 +372,13 @@ models:
   - model: qwen3.5:4b
     keep_alive: 30m
     think: true
+    tool_call_think: false
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 512
@@ -252,7 +390,13 @@ models:
   - model: qwen3-vl:4b
     keep_alive: 30m
     think: true
+    tool_call_think: false
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 116736
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 256
@@ -265,6 +409,11 @@ models:
     keep_alive: 20m
     think: true
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 256
@@ -277,6 +426,11 @@ models:
     keep_alive: 20m
     think: false
     warmup: false
+    reserved_output_tokens: 2048
+    safety_headroom_tokens: 2048
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 60211
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 65536
       num_batch: 256
@@ -288,6 +442,11 @@ models:
     keep_alive: 20m
     think: false
     warmup: false
+    reserved_output_tokens: 2048
+    safety_headroom_tokens: 2048
+    proactive_summarization_enabled: false
+    proactive_summarization_threshold_tokens: 0
+    recovery_strategy: drop_oldest
     options:
       num_ctx: 40960
       num_batch: 256
@@ -297,6 +456,11 @@ models:
     keep_alive: 15m
     think: true
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 256
@@ -309,6 +473,11 @@ models:
     keep_alive: 15m
     think: true
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 120422
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 131072
       num_batch: 384

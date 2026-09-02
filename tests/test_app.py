@@ -392,8 +392,8 @@ class RouterPayloadTests(unittest.TestCase):
             opts = payload["options"]
             self.assertEqual(opts["num_ctx"], 131072)
             self.assertEqual(opts["num_batch"], 256)
-            self.assertEqual(opts["temperature"], 0.12)
-            self.assertEqual(payload["keep_alive"], "45m")  # from policy
+            self.assertEqual(opts["temperature"], 0.1)
+            self.assertEqual(payload["keep_alive"], "30m")  # from policy
 
     def test_build_payload_uses_model_keep_alive_when_request_omits_it(self):
         """Test with Orin profile model (nemotron-cascade-2:30b-a3b-q4_K_M)."""
@@ -425,6 +425,46 @@ class RouterPayloadTests(unittest.TestCase):
                 del os.environ["MODEL_POLICY_FILE"]
             # Reload the module to restore original state
             importlib.reload(app_module)
+
+    def test_ollama_model_is_evicted_falls_back_to_api_tags(self):
+        """If /api/ps cannot be queried, the stalled-stream probe should fall back to /api/tags."""
+        import app as app_module
+
+        class _FakeTagsResponse:
+            def __init__(self, payload, status_code=200):
+                self._payload = payload
+                self.status_code = status_code
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class _FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                self.calls = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url):
+                self.calls.append(url)
+                if url.endswith("/api/ps"):
+                    raise RuntimeError("ps unavailable")
+                if url.endswith("/api/tags"):
+                    return _FakeTagsResponse({"models": [{"name": "qwen3:4b"}, {"name": "gpt-oss:20b"}]})
+                raise AssertionError(f"unexpected url: {url}")
+
+        original_client = app_module.httpx.AsyncClient
+        try:
+            app_module.httpx.AsyncClient = _FakeAsyncClient
+            self.assertTrue(asyncio.run(app_module._ollama_model_is_evicted("nemotron-cascade-2:30b-a3b-q4_K_M")))
+        finally:
+            app_module.httpx.AsyncClient = original_client
 
 
 class TestWarmupAutoPull(unittest.IsolatedAsyncioTestCase):

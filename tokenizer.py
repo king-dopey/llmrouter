@@ -88,7 +88,12 @@ def _make_tiktoken_counter(enc_name: str) -> Optional[Callable[[str], int]]:
     def _count(text: str) -> int:
         if not text:
             return 0
-        return len(enc.encode(text))
+        try:
+            return len(enc.encode(text))
+        except ValueError:
+            # Raw special-token text shows up in code and scan artifacts; count it
+            # as ordinary text rather than raising and forcing a noisy fallback.
+            return len(enc.encode(text, disallowed_special=()))
 
     return _count
 

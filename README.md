@@ -28,7 +28,7 @@ Select the profile at runtime via the `HARDWARE_PROFILE` environment variable (d
 
 ### Profile File Layout
 
-```
+```text
 profiles/
 ├── router.env               # Router-specific runtime variables
 ├── qdrant.env               # Qdrant-specific runtime variables
@@ -56,11 +56,28 @@ Environment variables are organized by concern and loaded via Docker Compose `en
 
 To deploy, copy `.env.example` to `.env` and adjust values for your environment. The active hardware profile is selected via `HARDWARE_PROFILE=orin` or `HARDWARE_PROFILE=thor`.
 
-## Files
+## File Layout
+
+All router Python modules live at the **project root** (not in a `router/` subdirectory).
+The Dockerfile copies these into `/app/` inside the container.
+
+| Module | Purpose |
+| --- | --- |
+| [`app.py`](app.py) | FastAPI router application, chat completions, embeddings |
+| [`policy.py`](policy.py) | Think policy configuration and evaluation |
+| [`tokenizer.py`](tokenizer.py) | Token counting (tiktoken + approximate fallback) |
+| [`router_headroom.py`](router_headroom.py) | Headroom-ai compression integration and budget enforcement |
+| [`retrieval.py`](retrieval.py) | Qdrant hybrid retrieval (dense + sparse + RRF) |
+| [`ingest_repo.py`](ingest_repo.py) | Repository ingestion into Qdrant collection |
+
+Other key files:
 
 - [`docker-compose.yml`](docker-compose.yml): OpenAI-compatible router and optional Qdrant vector database.
 - [`model_policy.yml`](model_policy.yml): Default policy file; the runtime profile overrides this via mount.
 - [`.env.example`](.env.example): environment values for ports, profile selection, and model behavior.
+
+> **Note on documentation paths**: Some plan documents reference `router/app.py`, `router/tokenizer.py`, etc.
+> These are historical references from an earlier layout. The actual files are at the workspace root as shown above.
 
 ## Network and Security Notes
 
@@ -130,17 +147,19 @@ See [GPU Acceleration Support](#gpu-acceleration-support) for detailed configura
 
 The Orin 64 GB node is sized to keep two MoE models warm by default while leaving headroom for KV cache, the router, and the OS.
 
-| Model ID | Purpose | Default keep_alive | Default think | Supported `num_ctx` Ceiling | Notes |
-| --- | --- | --- | --- | --- | --- |
-| `qwen3.6:35b-a3b` | Default chat and narrative summarization workloads. | `-1` (stay warm) | `true` | `32768` | Primary default model; hybrid attention keeps KV usage comparatively small. |
-| `qwen3-embedding:4b` | Embedding service for Qdrant retrieval. | `-1` (stay warm) | `false` | `8192` | Always resident for continuous retrieval. |
-| `qwen3-coder:30b` | Strict-JSON and structured-output workloads for boundary selection and cue-ID extraction. | `10m` | `false` | `65536` | Coding model; no longer pinned, stays warm during use. |
-| `qwen3:4b` | Fast assistant / routing model. | `10m` | `true` | `65536` | Lightweight fallback for simple queries. |
-| `qwen3-vl:4b` | Vision-language tasks (image understanding). | `10m` | `true` | `65536` | Multimodal input support. |
-| `gemma4:12b` | Mid-tier general-purpose model. | `10m` | `true` | `65536` | Alternative for creative tasks. |
-| `nemotron-cascade-2:30b-a3b-q4_K_M` | Optional reasoning verifier for ambiguous structured answers. | `10m` | `true` | `65536` | Only resident while actively in use; expect one warm-model eviction when it loads. |
-| `gpt-oss:20b` | Secondary general-purpose model. | `10m` | `true` | `65536` | Fallback for diverse tasks. |
-| `laguna-xs-2.1:q4_K_M` | Lightweight reasoning / utility model. | `10m` | `true` | `65536` | Small-footprint helper. |
+| Model ID | Purpose | Default keep_alive | Default think | tool_call_think | retry_on_failure | Supported `num_ctx` Ceiling | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen3.6:35b-a3b` | Default chat and narrative summarization workloads. | `-1` (stay warm) | `true` | `false` | `true` | `32768` | Primary default model; hybrid attention keeps KV usage comparatively small. Safety invariant prevents think+tools loops. |
+| `qwen3.6:35b-a3b-coding` | A/B candidate for Python/MCP implementation work. | `15m` | `true` | `false` | `true` | `65536` | Coding-specialized variant for comparison with qwen3.6:35b-a3b. MoE model ~18-24 GB. |
+| `qwen3-embedding:4b` | Embedding service for Qdrant retrieval. | `-1` (stay warm) | `false` | - | - | `8192` | Always resident for continuous retrieval. |
+| `qwen3-coder:30b` | Strict-JSON and structured-output workloads for boundary selection and cue-ID extraction. | `10m` | `false` | `false` | `true` | `65536` | Coding model; no longer pinned, stays warm during use. Safety invariant enforced. |
+| `qwen3:4b` | Fast assistant / routing model. | `10m` | `true` | `false` | `true` | `65536` | Lightweight fallback for simple queries. Safety invariant enforced. |
+| `qwen3-vl:4b` | Vision-language tasks (image understanding). | `10m` | `true` | `false` | `true` | `65536` | Multimodal input support. Safety invariant enforced. |
+| `qwen3.8:27b-q8_0` | Marginal model for short-context tasks. | `10m` | `true` | `false` | `true` | `32768` | WARNING: ~27 GB at Q8, leaves minimal headroom. Short-context only (<16K tokens). Prefer qwen3.6:35b-a3b for production. |
+| `gemma4:12b` | Mid-tier general-purpose model. | `10m` | `true` | - | - | `65536` | Alternative for creative tasks. No safety invariant (non-Qwen). |
+| `nemotron-cascade-2:30b-a3b-q4_K_M` | Optional reasoning verifier for ambiguous structured answers. | `10m` | `true` | - | - | `65536` | Only resident while actively in use; expect one warm-model eviction when it loads. |
+| `gpt-oss:20b` | Secondary general-purpose model. | `10m` | `true` | - | - | `65536` | Fallback for diverse tasks. |
+| `laguna-xs-2.1:q4_K_M` | Lightweight reasoning / utility model. | `10m` | `true` | - | - | `65536` | Small-footprint helper. |
 
 #### Orin Budget Math
 
@@ -162,26 +181,46 @@ The two-warm plan is only valid at Q4_K_M with `q8_0` KV cache. The external LLM
 
 The Thor profile targets larger context windows and a broader model catalog, leveraging the newer Blackwell architecture.
 
-| Model ID | Purpose | Default keep_alive | Default think | Supported `num_ctx` Ceiling | Notes |
-| --- | --- | --- | --- | --- | --- |
-| `qwen3.6:35b-a3b-q8_0` | Default chat and primary coding/planning model. | `-1` (stay warm) | `true` | `262144` | Primary default; stays warm for all standard workloads. |
-| `qwen3-embedding:8b` | Code search / indexing embedding model. | `-1` (stay warm) | `false` | `40960` | Always hot; native 4096-dim embeddings for code indexing. |
-| `qwen3.8:27b-q8_0` | Escalation model for complex coding/planning/reasoning. | `45m` | `true` | `262144` | Hard task upgrade over qwen3.6; router-side medium reasoning recommended. |
-| `qwen3.8:27b-bf16` | Explicit quality-first model for important complex tasks. | `15m` | `true` | `262144` | Manual escalation only; ~8-15x task-time vs qwen3.6 baseline. |
-| `qwen3-coder-next:q4_K_M` | Direct-edit / no-think coding fallback for straightforward tasks. | `30m` | `false` | `131072` | Parser-stable output; deprecated as primary coder. |
-| `laguna-xs-2.1:q4_K_M` | Experimental coding alternative (high loop risk). | `15m` | `true` | `131072` | A/B testing only; demoted due to loop risk in this environment. |
-| `gemma4:31b-it-q4_K_M` | Large non-Qwen general-purpose model. | `20m` | `true` | `131072` | Heavyweight but capable for complex tasks. |
-| `devstral-small-2:24b-instruct-2512-q8_0` | French-language and multilingual instruction model. | `15m` | `true` | `131072` | Specialized language support. |
-| `north-mini-code-1.0:q8_0` | Compact coding assistant. | `15m` | `true` | `131072` | Fast code generation. |
-| `granite4.1-guardian:8b-q6_K` | Security review / policy gate model. | `20m` | `false` | `65536` | Primary model for security-review stage. |
-| `qwen3:4b` | Fast assistant / routing model. | `30m` | `true` | `65536` | Lightweight fallback. |
-| `qwen3.5:4b` | Small replacement path for qwen3:4b and qwen3-vl:4b. | `30m` | `true` | `65536` | Successor to qwen3:4b. |
-| `qwen3-vl:4b` | Vision-language tasks (image understanding). | `30m` | `true` | `65536` | Multimodal input support; kept until callers migrate. |
-| `gemma4:12b` | Medium-size general alternative. | `20m` | `true` | `65536` | Creative tasks alternative. |
-| `reader-lm:1.5b` | Document reading / extraction specialist. | `20m` | `false` | `65536` | Non-thinking document processing. |
-| `qwen3-embedding:4b` | Transition embedding model (deprecated in favor of 8b). | `20m` | `false` | `8192` | Keep until all clients move to 8b. |
-| `nemotron-cascade-2:30b-a3b-q4_K_M` | Optional reasoning verifier. | `15m` | `true` | `131072` | Reasoning verification. |
-| `gpt-oss:20b` | Secondary general-purpose model. | `15m` | `true` | `131072` | Diverse task fallback. |
+| Model ID | Purpose | Default keep_alive | Default think | tool_call_think | retry_on_failure | Supported `num_ctx` Ceiling | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen3.6:35b-a3b-q8_0` | Default chat and primary coding/planning model. | `-1` (stay warm) | `true` | `false` | `true` | `262144` | Primary default; stays warm for all standard workloads. Safety invariant prevents think+tools loops. |
+| `qwen3.6:35b-a3b-coding` | A/B candidate for Python/MCP implementation work. | `15m` | `true` | `false` | `true` | `262144` | Coding-specialized variant for comparison with qwen3.6:35b-a3b-q8_0. |
+| `qwen3-embedding:8b` | Code search / indexing embedding model. | `-1` (stay warm) | `false` | - | - | `40960` | Always hot; native 4096-dim embeddings for code indexing. |
+| `qwen3.8:27b-q8_0` | Escalation model for complex coding/planning/reasoning. | `45m` | `true` | `false` | `true` | `262144` | Hard task upgrade over qwen3.6; router-side medium reasoning recommended. Safety invariant enforced. |
+| `qwen3.8:27b-bf16` | Explicit quality-first model for important complex tasks. | `15m` | `true` | `false` | `true` | `262144` | Manual escalation only; ~8-15x task-time vs qwen3.6 baseline. Safety invariant enforced. |
+| `qwen3-coder-next:q4_K_M` | Direct-edit / no-think coding fallback for straightforward tasks. | `30m` | `false` | `false` | `true` | `131072` | Parser-stable output; deprecated as primary coder. Safety invariant enforced. |
+| `laguna-xs-2.1:q4_K_M` | Experimental coding alternative (high loop risk). | `15m` | `true` | - | - | `131072` | A/B testing only; demoted due to loop risk in this environment. |
+| `gemma4:31b-it-q4_K_M` | Large non-Qwen general-purpose model. | `20m` | `true` | - | - | `131072` | Heavyweight but capable for complex tasks. No safety invariant (non-Qwen). |
+| `devstral-small-2:24b-instruct-2512-q8_0` | French-language and multilingual instruction model. | `15m` | `true` | - | - | `131072` | Specialized language support. |
+| `north-mini-code-1.0:q8_0` | Compact coding assistant. | `15m` | `true` | - | - | `131072` | Fast code generation. |
+| `granite4.1-guardian:8b-q6_K` | Security review / policy gate model. | `20m` | `false` | - | - | `65536` | Primary model for security-review stage. |
+| `qwen3:4b` | Fast assistant / routing model. | `30m` | `true` | `false` | `true` | `65536` | Lightweight fallback. Safety invariant enforced. |
+| `qwen3.5:4b` | Small replacement path for qwen3:4b and qwen3-vl:4b. | `30m` | `true` | `false` | `true` | `131072` | Successor to qwen3:4b. Safety invariant enforced. |
+| `qwen3-vl:4b` | Vision-language tasks (image understanding). | `30m` | `true` | `false` | `true` | `131072` | Multimodal input support; kept until callers migrate. Safety invariant enforced. |
+| `gemma4:12b` | Medium-size general alternative. | `20m` | `true` | - | - | `131072` | Creative tasks alternative. No safety invariant (non-Qwen). |
+| `reader-lm:1.5b` | Document reading / extraction specialist. | `20m` | `false` | - | - | `65536` | Non-thinking document processing. |
+| `qwen3-embedding:4b` | Transition embedding model (deprecated in favor of 8b). | `20m` | `false` | - | - | `8192` | Keep until all clients move to 8b. |
+| `nemotron-cascade-2:30b-a3b-q4_K_M` | Optional reasoning verifier. | `15m` | `true` | - | - | `131072` | Reasoning verification. |
+| `gpt-oss:20b` | Secondary general-purpose model. | `15m` | `true` | - | - | `131072` | Diverse task fallback. |
+
+### Hardware Compatibility Notes
+
+**Orin 64GB:**
+
+- ✅ qwen3.6:35b-a3b (MoE, ~18-24 GB) - Primary default
+- ✅ qwen3.6:35b-a3b-coding (MoE, ~18-24 GB) - A/B candidate
+- ✅ qwen3-coder:30b (~18-19 GB) - Coding worker
+- ⚠️ qwen3.8:27b-q8_0 (~27 GB) - Marginal, short-context only
+- ❌ qwen3-coder-next:q4_K_M (~52 GB) - Excluded (too large)
+- ❌ qwen3.8:27b-bf16 (~54 GB) - Excluded (too large)
+
+**Thor 128GB:**
+
+- ✅ All Orin models
+- ✅ qwen3.8:27b-q8_0 (~27 GB) - Comfortable fit
+- ✅ qwen3.8:27b-bf16 (~54 GB) - High-quality reasoning
+- ✅ qwen3-coder-next:q4_K_M (~52 GB) - Direct-edit fallback
+- ✅ qwen3.6:35b-a3b-coding - A/B candidate for Python/MCP work
 
 ## Operator Host Setup
 
@@ -365,23 +404,142 @@ curl -sS http://127.0.0.1:${ROUTER_PORT:-4000}/v1/models | jq .
 
 ## Think Control Policy (Router -> External LLM Backend)
 
-The router injects the `think` flag in requests to the external LLM backend (Ollama) based on policy.
+The router implements a ReAct-aligned think control policy that determines when models should use extended thinking based on request context, model capabilities, and safety requirements. The policy uses a three-tier rule hierarchy evaluated top-to-bottom (first match wins).
 
-Policy defaults:
+### Three-Tier Rule Hierarchy
+
+**Rule 1: Safety Invariant (Absolute Priority)**
+- Condition: Tools present AND `tool_call_think=False`
+- Action: Return `think=False` (unconditionally)
+- Rationale: Prevents Qwen3 models from entering deterministic looping behavior
+
+**Rule 2: Tool Request Handling (Fail-Safe)**
+- Condition: Tools present AND `tool_call_think` is not `False`
+- Action: Evaluate override and policy
+  - Valid override (`tool_call_true`) → `think=True`
+  - Invalid override → `think=False` (deny by default)
+  - Explicit `tool_call_think` policy → use it
+  - No explicit policy → `think=False` (fail-safe)
+
+**Rule 3: Non-Tool Request Handling (ReAct-Aligned)**
+- Condition: No tools present
+- Action: Evaluate override and character threshold
+  - Override present → use it
+  - Combined message characters ≥ `char_threshold` → `think=False`
+  - Otherwise → return `default_think` (from model config)
+
+### Recent Changes (ReAct-Aligned Policy Redesign)
+
+The policy has been redesigned to align with ReAct (Reasoning and Acting) principles:
+
+**Removed Legacy Heuristics:**
+- `DISABLE_THINK_TOOL_PATTERNS` - Previously disabled thinking based on tool name patterns
+- `DISABLE_THINK_SUMMARY_PATTERNS` - Previously disabled thinking based on summary keywords
+- Pattern matching functions (`_collect_tool_names()`, `_last_user_text()`, etc.)
+
+**Rationale:** The legacy heuristics incorrectly disabled thinking for summary and analysis tasks when conversation history contained tool references. The new policy evaluates each turn based on its own task requirements, using `char_threshold` as the sole determinant for non-tool requests.
+
+**Simplified Configuration:**
+`ThinkPolicyConfig` now contains only `char_threshold` (default: 12000). The legacy fields have been removed.
+
+### Safety Invariant for Tool-Call Thinking
+
+**Critical:** The router enforces a configuration-driven safety invariant to prevent Qwen3 models from entering infinite loops when tools are present.
+
+Any model configured with `tool_call_think: false` in `models.yaml` **cannot** be overridden to `think: true` when tools are present in the request. This safety invariant executes before any override logic, ensuring it cannot be bypassed.
+
+**Example Configuration:**
+
+```yaml
+# profiles/orin/models.yaml or profiles/thor/models.yaml
+- model: qwen3.6:35b-a3b
+  think: true                    # Default behavior when no tools present
+  tool_call_think: false         # Safety invariant: cannot be overridden when tools present
+  keep_alive: 15m
+```
+
+**Behavior:**
+
+- Request with tools + `tool_call_think: false` → `think: false` (safety invariant enforced)
+- Request with tools + `tool_call_think: false` + `X-Ollama-Think: tool_call_true` → `think: false` (safety invariant cannot be bypassed)
+- Request without tools + `tool_call_think: false` → `think: true` (safety invariant only applies when tools present)
+
+For complete technical documentation, see [docs/think-policy.md](docs/think-policy.md).
+
+### Tool-Call Retry Guard
+
+The router includes a one-shot retry guard to prevent infinite agent loops when models mention tools in text but fail to produce structured tool_calls.
+
+**How It Works:**
+1. When a model returns assistant text mentioning a tool but no structured `tool_calls`
+2. The router detects this failure condition
+3. Automatically retries once with `think: false` and low temperature (0.1)
+4. Returns the retry result or a structured error if retry fails
+
+**Configuration:**
+
+```yaml
+# profiles/orin/models.yaml or profiles/thor/models.yaml
+- model: qwen3.6:35b-a3b
+  retry_on_tool_call_failure: true   # Enable retry guard (default: false)
+  retry_temperature: 0.1              # Temperature for retry (default: 0.1)
+```
+
+**Behavior:**
+
+- Retry is **opt-in per model** via `retry_on_tool_call_failure` (defaults to `false` when not set)
+- Forces `think: false` to prevent reasoning loops
+- Uses low temperature (configurable) for deterministic output
+- Removes invalid assistant response before retry
+- Returns HTTP 502 with `retry_attempted: true` if retry fails
+- Works for both streaming and non-streaming requests
+
+**Example Error Response:**
+
+```json
+{
+  "error": "tool_call_retry_failed",
+  "message": "Model failed to produce structured tool_calls after retry",
+  "retry_attempted": true,
+  "retry_error": "Retry did not produce tool_calls"
+}
+```
+
+All Qwen models in Orin and Thor profiles have retry guard enabled by default.
+
+### Policy Defaults
+
+The router implements a ReAct-aligned think policy that evaluates each turn based on its own task requirements, not conversation history:
 
 - Per-model defaults come from the active profile's `models.yaml` (mounted as `model_policy.yml`).
 - `qwen3-coder:30b` (Orin) and `qwen3-coder-next:q4_K_M` (Thor) default to `think=false`.
 - Most general-purpose models default to `think=true`.
-- `think=false` for web/browse/search-style tool flows (for example `web_search`, `browser`, `http_get`, `fetch`, `scrape`).
-- `think=true` for non-web tools such as `file_search` and `openweather` unless summarization/size heuristics trigger `think=false`.
-- `think=false` when message content is very large (`DISABLE_THINK_CHAR_THRESHOLD`) and for summary-like last-user turns over recent tool-heavy or long context.
+- **Rule 1**: Models with `tool_call_think: false` and tools present → `think=false` (safety invariant, no overrides)
+- **Rule 2**: Models with tools present → explicit `tool_call_think` policy or fail-safe to `false`
+- **Rule 3**: No tools present → apply character threshold heuristic, then default
+  - `think=false` when message content exceeds `DISABLE_THINK_CHAR_THRESHOLD` (12000 chars)
+  - Otherwise, use model's default `think` value from `models.yaml`
 
-Manual override header:
+**Note**: The legacy `DISABLE_THINK_TOOL_PATTERNS` and `DISABLE_THINK_SUMMARY_PATTERNS` environment variables have been removed. The policy no longer disables thinking based on tool name patterns or summary keywords in conversation history. Each turn is evaluated independently per ReAct principles.
 
-- `X-Ollama-Think: true`
-- `X-Ollama-Think: false`
+### Override Headers
 
-If the override header is present, it takes precedence over policy.
+The router accepts three override values via the `X-Ollama-Think` header:
+
+| Header Value | Behavior | Use Case |
+| --- | --- | --- |
+| `true` | Force `think: true` | Enable thinking for non-tool requests |
+| `false` | Force `think: false` | Disable thinking for any request |
+| `tool_call_true` | Force `think: true` for tool requests | Enable thinking for non-safety-constrained models with tools |
+
+**Override Validation:**
+
+- Invalid override values are rejected with HTTP 400
+- When tools are present, only `tool_call_true` is accepted as a valid override
+- Any other override value with tools present defaults to `think: false` (fail-safe)
+- Safety invariant takes precedence over all override attempts for models with `tool_call_think: false`
+
+For complete override handling documentation, see [docs/think-policy.md](docs/think-policy.md).
 
 The router forwards the following request fields unchanged to the external LLM backend:
 
@@ -406,14 +564,14 @@ curl -sS http://127.0.0.1:${ROUTER_PORT:-4000}/v1/chat/completions \
   }' | jq .
 ```
 
-Example B: same request but force `think=true` with header override.
+Example B: same request but force `think=true` with header override (for non-safety-constrained model).
 
 ```bash
 curl -sS http://127.0.0.1:${ROUTER_PORT:-4000}/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-Ollama-Think: true' \
+  -H 'X-Ollama-Think: tool_call_true' \
   -d '{
-    "model": "qwen3.6:35b-a3b",
+    "model": "gemma4:12b",
     "messages": [
       {"role": "user", "content": "Use web search and summarize key takeaways."}
     ],
@@ -422,6 +580,8 @@ curl -sS http://127.0.0.1:${ROUTER_PORT:-4000}/v1/chat/completions \
     ]
   }' | jq .
 ```
+
+**Note:** The `tool_call_true` override is only valid for models without `tool_call_think: false` configured. For Qwen models with the safety invariant enabled, this override will be ignored and `think: false` will be enforced.
 
 ### Default/general model (stays warm)
 
@@ -541,11 +701,55 @@ The router uses the public Python library API from [headroom-ai](https://github.
 
 ### How It Works
 
-When enabled, the router injects optional retrieval context, constructs the complete Ollama payload, and calls `headroom.compress(messages, model=..., config=_HEADROOM_CONFIG)` once on the finalized message list. The `_HEADROOM_CONFIG` singleton is configured with `compress_system_messages=False` to preserve Zoo Code's tool definitions, usage instructions, and protocol from being compressed.
+Compaction (headroom.compress) runs on **every request unconditionally** — this is HEADROOM's core purpose. When enabled, the router injects optional retrieval context, constructs the complete Ollama payload, and calls `headroom.compress(messages, model=..., config=_HEADROOM_CONFIG)` once on the finalized message list. The `_HEADROOM_CONFIG` singleton is configured with `compress_system_messages=False` to preserve Zoo Code's tool definitions, usage instructions, and protocol from being compressed.
 
 Headroom selects supported transforms internally based on content type (JSON, code, text, etc.). The router does not split history, drop turns, implement its own cache alignment, or maintain a separate compression store.
 
-After compression, the router validates that tool_calls structure survived intact via `_validate_tool_integrity()`. If validation fails, the router falls back to original uncompressed messages with a warning log. A compressed prompt that still cannot fit is rejected rather than silently discarding conversation history.
+After compression, the router validates that tool_calls structure survived intact via `_validate_tool_integrity()`. If validation fails, the router falls back to original uncompressed messages with a warning log.
+
+### Proactive Summarization and Recovery Pipeline
+
+The router has two distinct phases:
+
+1. Proactive summarization/compression runs before the upstream call when a model's configured threshold is reached.
+2. Reactive overflow recovery runs only after Ollama rejects the request due to context overflow.
+
+A request is considered proactive when its prompt size reaches the model's configured threshold before generation. That threshold is evaluated using the same budget math as the router's input budget:
+
+`effective_input_budget = model_context_window - reserved_output_tokens - safety_headroom_tokens`
+
+The proactive path is non-dropping: it may apply stronger Headroom-native compression or summarization, but it must not strip messages or tool-call segments.
+
+When upstream Ollama returns an HTTP 400 error indicating context overflow (for example "context length exceeded", "prompt too long", "input length exceeds"), the router uses a bounded recovery ladder:
+
+1. Detect context overflow with `is_context_overflow_error(status_code, response_text)`.
+2. Run the v2 ladder via `apply_recovery_ladder(...)` when `HEADROOM_RECOVERY_LADDER_V2=1`.
+3. Retry upstream only when the payload changed materially (`changed=True`).
+4. Stop after `HEADROOM_RECOVERY_MAX_RETRIES` attempts and propagate the upstream error if still failing.
+
+The v2 ladder is stage-based and fixed: it always tries stronger Headroom compression first, then optional large-text compression, and only then performs oldest-first segment stripping as a last resort. The `recovery_strategy` name is compatibility metadata only; it does not select a different recovery algorithm when v2 is enabled.
+
+### Zoo Context Condensing Interception
+
+Zoo Code context-condensing operations are intercepted by the router so Headroom remains the single context-management authority.
+
+Flow:
+
+1. Zoo sends a minimal condense routing signal (recommended canonical prompt):
+  `ZOO_CONTEXT_CONDENSE_V1: delegate context condensing to router headroom pipeline.`
+2. The router detects this explicit condense signal only.
+3. The router removes trigger-only messages and runs the same Headroom compaction/proactive/recovery pipeline on the remaining conversation context.
+4. The router returns a synthetic OpenAI-compatible condensed-context response back to Zoo.
+
+This allows Zoo to run at the model's true configured context window and avoids context waste from an oversized client-side condense template.
+
+#### Segment and Tool Integrity Guarantees
+
+1. No role-only stripping is used in ladder v2.
+2. Final segment stripping removes complete chronological segments, not isolated message roles.
+3. Segment removal is blocked when it would orphan `tool_call_id` linkage across segment boundaries.
+4. The router preserves at least `HEADROOM_RECOVERY_MIN_SEGMENTS_TO_KEEP` newest segments while trimming older history.
+5. If no safe material reduction is possible, the router returns the upstream error instead of mutating into inconsistent history.
 
 ### API Contract
 
@@ -561,8 +765,28 @@ Each model in the active profile's [`models.yaml`](profiles/orin/models.yaml) or
 
 | Parameter | Description | Example |
 | --- | --- | --- |
-| `reserved_output_tokens` | Tokens reserved for generation output | `4096` |
-| `safety_headroom_tokens` | Extra buffer for unexpected tokens | `4096` |
+| `reserved_output_tokens` | Space reserved for the model's generated response. Higher values leave less room for input and trigger proactive/compression/recovery sooner; lower values increase usable input context but raise output-overflow risk. | `4096` |
+| `safety_headroom_tokens` | Extra buffer for tokenizer variance, wrappers, tool/schema overhead, and unexpected token growth. Higher values make the request more conservative and reduce overflow surprises; lower values optimize utilization but raise overflow risk. | `4096` |
+| `proactive_summarization_enabled` | Enables the pre-flight summary/compression pass when prompt token count reaches the configured threshold. | `true` |
+| `proactive_summarization_threshold_tokens` | Input-context threshold before generation. The router compares the current prompt token count against this value using the same budget math as the active model context window. | `12000` |
+| `recovery_strategy` | Legacy compatibility field only. When `HEADROOM_RECOVERY_LADDER_V2=1`, the router ignores the name and always uses the fixed v2 stage order: stronger compression, then text compression, then last-resort stripping. | `drop_oldest` |
+
+The effective input budget is calculated as:
+
+`effective_input_budget = model_context_window - reserved_output_tokens - safety_headroom_tokens`
+
+Example policy entry:
+
+```yaml
+- model: qwen3-coder:30b
+  keep_alive: 10m
+  think: false
+  reserved_output_tokens: 2048
+  safety_headroom_tokens: 2048
+  proactive_summarization_enabled: true
+  proactive_summarization_threshold_tokens: 12000
+  recovery_strategy: drop_oldest
+```
 
 The router does not expose Headroom MCP tools, proxy routes, custom CCR retrieval, or an internal retrieval tool. Those capabilities require a separately designed and approved integration.
 
@@ -571,6 +795,15 @@ The router does not expose Headroom MCP tools, proxy routes, custom CCR retrieva
 | Variable | Default | Description |
 | --- | --- | --- |
 | `HEADROOM_ENABLED` | `1` | Set to `0`, `false`, `off`, or `no` to disable headroom compression entirely |
+| `HEADROOM_RECOVERY_LADDER_V2` | `1` in profiles/router.env | Enables the modern overflow-recovery ladder instead of the legacy trim-only path |
+| `HEADROOM_RECOVERY_ENABLE_STRONGER_COMPRESSION` | `1` | Enables stronger Headroom compression profiles before message removal |
+| `HEADROOM_RECOVERY_ENABLE_TEXT_COMPRESSION` | `1` | Enables optional large-text compression via Headroom transforms when available |
+| `HEADROOM_RECOVERY_ENABLE_SEGMENT_STRIPPING` | `1` | Enables last-resort linear segment stripping when earlier recovery steps are still over budget |
+| `HEADROOM_RECOVERY_MAX_RETRIES` | `1` | Maximum overflow retries after a successful material reduction |
+| `HEADROOM_RECOVERY_MIN_TOKEN_DELTA` | `32` | Minimum token reduction required before a recovery step counts as material |
+| `HEADROOM_RECOVERY_MIN_STRIP_TOKEN_DELTA` | `1` | Minimum token reduction required from segment stripping before retrying |
+| `HEADROOM_RECOVERY_MIN_SEGMENTS_TO_KEEP` | `1` | Minimum newest segments retained while truncating older history |
+| `ZOO_CONTEXT_CONDENSE_TRIGGER` | `ZOO_CONTEXT_CONDENSE_V1: delegate context condensing to router headroom pipeline.` | Canonical Zoo condense signal string matched by router interception |
 
 ### Disabling Headroom
 
@@ -635,7 +868,7 @@ This behavior eliminates transient failures during model warm-up and improves re
 
 ## Testing
 
-The project includes a comprehensive pytest test suite with **260+ tests** covering all core modules including headroom-ai compression (with config validation), tokenization, think policy evaluation, Qdrant retrieval, embeddings, streaming, and usage tracking.
+The project includes a comprehensive pytest test suite with **336 tests** covering all core modules including headroom-ai compression (with config validation), tokenization, think policy evaluation, tool-call retry guard, Qdrant retrieval, embeddings, streaming, and usage tracking.
 
 > **Important:** Tests must run inside the Docker container. Running tests on the host will fail because `headroom-ai` and its ML dependencies (PyTorch, transformers, etc.) are only available in the container environment. See [TESTING.md](TESTING.md) for details.
 
@@ -660,11 +893,12 @@ docker run --rm llmrouter-audit python3 -m pytest tests/test_tokenizer.py -v
 ### Test Markers
 
 | Marker | Description | Count |
-|--------|-------------|-------|
+| --- | --- | --- |
 | `base` | Base compression + config/validation | 45 |
 | `code` | Code compression | 12 |
 | `tokenizer` | Token counting | 19 |
 | `policy` | Think policy | 35 |
+| `retry` | Tool-call retry guard | 17 |
 | `retrieval` | Qdrant retrieval | 15 |
 | `embeddings` | Embedding endpoints | 14 |
 | `streaming` | SSE streaming | 23 |

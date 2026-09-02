@@ -2,7 +2,7 @@
 
 This document describes the comprehensive testing strategy for the OpenAI-Compatible Router for Ollama LLM. Tests are organized into two categories:
 
-1. **Unit/Integration Tests** — Python `unittest` suite in [`tests/`](../tests/) that validates core logic without requiring a running container.
+1. **Unit/Integration Tests** — Python `unittest` suite in [`tests/`](../tests/) that validates core logic. For Headroom-dependent scenarios, run in the Docker audit image.
 2. **Validation Scripts** — Bash scripts in [`scripts/validation/`](../scripts/validation/) that verify profile configuration, model availability, and runtime state against the active profile.
 
 ## Quick Reference
@@ -27,6 +27,7 @@ All Python tests use the standard library [`unittest`](https://docs.python.org/3
 |---|---|---|
 | [`test_app.py`](../tests/test_app.py) | Core application logic and request handling | Router endpoint behavior, model policy enforcement, error responses |
 | [`test_chat_completions_integration.py`](../tests/test_chat_completions_integration.py) | Chat completion flow end-to-end (mocked) | Message routing, tool call handling, streaming vs non-streaming paths |
+| [`test_headroom_base.py`](../tests/test_headroom_base.py) | Recovery ladder v2 coverage | Feature-flag ladder routing, material-change guard, linear segment stripping |
 | [`test_embeddings_endpoint.py`](../tests/test_embeddings_endpoint.py) | Embeddings API endpoint | Embedding request forwarding to Ollama, response parsing |
 | [`test_headroom.py`](../tests/test_headroom.py) | Headroom adapter | Public compression call, telemetry normalization, post-compression context check, explicit missing dependency, disabled passthrough |
 | [`test_nonstream_usage.py`](../tests/test_nonstream_usage.py) | Non-streaming response usage tracking | `prompt_tokens`, `completion_tokens`, `total_tokens` accounting |
@@ -48,6 +49,19 @@ python3 -m pytest tests/test_policy.py -v
 
 # Run with unittest discover
 python3 -m unittest discover tests/ -v
+```
+
+For Headroom SDK-dependent validation, use Docker audit flow from [`TESTING.md`](../TESTING.md):
+
+```bash
+docker build --target audit -t llmrouter-audit .
+docker run --rm -e HEADROOM_RECOVERY_LADDER_V2=1 llmrouter-audit \
+   python3 -m pytest \
+   tests/test_headroom_base.py::TestRecoveryLadderV2::test_stage_d_respects_min_segments_to_keep \
+   tests/test_headroom_base.py::TestRecoveryLadderV2::test_strip_oldest_segments_blocks_cross_segment_tool_orphans \
+   tests/test_chat_completions_integration.py::ChatCompletionIntegrationTests::test_nonstream_context_overflow_uses_recovery_ladder_when_enabled \
+   tests/test_chat_completions_integration.py::ChatCompletionIntegrationTests::test_nonstream_context_overflow_respects_max_retries_zero \
+   -v
 ```
 
 ### Test Architecture
@@ -196,6 +210,7 @@ bash scripts/validation/validate-thor-asr.sh
 │ Policy Engine        │ test_policy.py                           │
 │ Think Control        │ test_policy.py                           │
 │ Headroom/Context     │ test_headroom.py                         │
+│ Recovery Ladder V2   │ test_headroom_base.py, test_chat_completions_integration.py │
 │ Tokenizer            │ test_tokenizer.py                        │
 │ Chat Completions     │ test_chat_completions_integration.py     │
 │ Stream Usage         │ test_stream_usage.py                     │

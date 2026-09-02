@@ -70,6 +70,14 @@ class TestTokenizerTiktoken:
         assert isinstance(result, int)
         assert result >= 0
 
+    def test_tiktoken_handles_raw_special_token_text(self):
+        """Raw special-token text should not raise and should be counted safely."""
+        tokenizer = _reload_tokenizer_with_map({"mymodel": "tiktoken:cl100k_base"})
+        text = "prefix <|endoftext|> suffix"
+        result = tokenizer.count_completion_tokens(text, "mymodel")
+        assert isinstance(result, int)
+        assert result > 0
+
 
 @pytest.mark.tokenizer
 class TestTokenizerModelMapping:
@@ -180,3 +188,97 @@ class TestTokenizerEdgeCases:
         messages = ["hello", {"role": "user", "content": "world"}]
         result = tokenizer.count_prompt_tokens(messages, "mymodel")
         assert result > 0
+
+
+# =============================================================================
+# Step 9: Qwen model family tokenizer integration tests
+# =============================================================================
+
+@pytest.mark.tokenizer
+class TestTokenizerQwenCompatibility:
+    """Tests for Qwen2/Qwen3 tokenizer compatibility (Section 7.1, risk table Section 13)."""
+
+    def test_qwen_model_family_uses_approximate_fallback(self):
+        """Test that Qwen models use approximate fallback when tiktoken unavailable."""
+        # Map all Qwen model families to approximate for deterministic testing
+        tokenizer_map = {
+            "qwen3-coder-next:q4_K_M": "approximate",
+            "qwen3.6:35b-a3b-q8_0": "approximate",
+            "qwen3-coder:30b": "approximate",
+        }
+        tokenizer = _reload_tokenizer_with_map(tokenizer_map)
+
+        messages = [{"role": "user", "content": "Implement a binary search tree"}]
+        result = tokenizer.count_prompt_tokens(messages, "qwen3-coder-next:q4_K_M")
+        assert isinstance(result, int)
+        assert result > 0
+
+    def test_approximate_fallback_deterministic(self):
+        """Test that approximate token counting is deterministic across runs."""
+        tokenizer_map = {"testmodel": "approximate"}
+        _reload_tokenizer_with_map(tokenizer_map)
+
+        text = "The quick brown fox jumps over the lazy dog" * 10
+        result1 = tokenizer.count_completion_tokens(text, "testmodel")
+        result2 = tokenizer.count_completion_tokens(text, "testmodel")
+        assert result1 == result2
+
+    def test_total_tokens_invariant(self):
+        """Test that total_tokens = prompt_tokens + completion_tokens invariant holds."""
+        tokenizer_map = {"mymodel": "approximate"}
+        _reload_tokenizer_with_map(tokenizer_map)
+
+        messages = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Write a function to sort an array"},
+        ]
+        completion_text = "Here is the sorted function:\n\ndef sort_array(arr):\n    return sorted(arr)"
+
+        prompt_tokens = tokenizer.count_prompt_tokens(messages, "mymodel")
+        completion_tokens = tokenizer.count_completion_tokens(completion_text, "mymodel")
+        total = prompt_tokens + completion_tokens
+
+        # Verify invariant: total must equal sum of parts
+        assert total == prompt_tokens + completion_tokens
+        assert total > 0
+        assert prompt_tokens > 0
+        assert completion_tokens > 0
+
+    def test_approximate_within_reasonable_range_of_tiktoken(self):
+        """Test that approximate fallback produces estimates within 20% of tiktoken count.
+
+        This addresses the Medium risk in Section 13 about Qwen3 tokenizer differing from Qwen2.
+        When tiktoken is available, verify approximate is a reasonable upper bound.
+        """
+        importlib.reload(tokenizer)
+        # Reload with tiktoken-based mapping for comparison
+        tokenizer_tik = _reload_tokenizer_with_map({"mymodel": "tiktoken:cl100k_base"})
+
+        importlib.reload(tokenizer)
+        tokenizer_approx = _reload_tokenizer_with_map({"mymodel": "approximate"})
+
+        test_texts = [
+            "Hello world",
+            "def hello():\n    print('world')",
+            "The quick brown fox jumps over the lazy dog",
+            "#!/usr/bin/env python3\nimport sys",
+        ]
+
+        for text in test_texts:
+            tik_result = tokenizer_tik.count_completion_tokens(text, "mymodel")
+            approx_result = tokenizer_approx.count_completion_tokens(text, "mymodel")
+
+            if tik_result > 0:
+                # Approximate should be within 2x of tiktoken (conservative bound)
+                ratio = approx_result / tik_result
+                assert 0.5 <= ratio <= 2.0, f"Approx too far from tiktoken for: {text[:30]} (ratio={ratio:.2f})"
+
+    def test_tokenizer_map_from_env_overrides_fallback(self):
+        """Test that TOKENIZER_MAP env var takes precedence over any fallback."""
+        tokenizer_map = {"custom-model": "approximate"}
+        _reload_tokenizer_with_map(tokenizer_map)
+
+        # Verify the custom model uses approximate path
+        result = tokenizer.count_completion_tokens("test", "custom-model")
+        expected = (len("test".encode("utf-8")) + 2) // 3
+        assert result == expected

@@ -1,70 +1,153 @@
+# Orin 64GB model policy
+#
+# This file is tuned for Jetson AGX Orin 64GB local use with unified memory.
+# Compared with Thor, Orin requires more conservative context sizing because:
+#   - num_ctx reserves KV cache up front
+#   - large contexts can materially hurt latency and residency
+#   - always-hot models consume persistent unified memory
+#   - long-context aspirations often drift higher than what is practical on-device
+#
+# ---------------------------------------------------------------------------
+# Zoo Code mode routing guidance
+# ---------------------------------------------------------------------------
+# Recommended default mode mapping:
+#
+#   architect             -> qwen3.6:35b-a3b
+#   debug                 -> qwen3.6:35b-a3b
+#   code                  -> qwen3-coder:30b
+#   tester                -> qwen3.6:35b-a3b
+#   reviewer              -> qwen3.6:35b-a3b
+#   security-review       -> gemma4:12b
+#   documentation-writer  -> qwen3.6:35b-a3b
+#
+# Why this mapping:
+#   - Orin does not have comfortable headroom for qwen3.8-class local operation.
+#   - qwen3.6:35b-a3b becomes the best all-around planning/reasoning/default model.
+#   - qwen3-coder:30b is the preferred direct-edit / non-thinking coding worker.
+#   - gemma4:12b is a practical lighter alternate for review/security-style passes
+#     when you want separation from the primary Qwen path.
+#
+# Optional alternates:
+#   - gpt-oss:20b                    -> alternate reasoning/review model
+#   - nemotron-cascade-2:30b-a3b     -> heavier reasoning alternate; use sparingly
+#   - qwen3:4b                       -> compatibility / lightweight fallback
+#   - qwen3-vl:4b                    -> vision compatibility path
+#
+# ---------------------------------------------------------------------------
+# Operational model priorities
+# ---------------------------------------------------------------------------
+# Primary default:
+#   qwen3.6:35b-a3b
+#     - architect
+#     - debug
+#     - tester
+#     - reviewer
+#     - documentation
+#     - standard planning and coding oversight
+#
+# Primary coding worker:
+#   qwen3-coder:30b
+#     - direct edits
+#     - parser-stable output
+#     - lower-overbuild implementation
+#
+# Supporting roles:
+#   qwen3-embedding:4b               -> always-hot indexing / search
+#   qwen3-vl:4b                      -> vision compatibility
+#   qwen3:4b                         -> compatibility fallback
+#
+# Alternate / optional models:
+#   gemma4:12b                       -> medium-size general alternate
+#   gpt-oss:20b                      -> alternate reasoning/review
+#   nemotron-cascade-2:30b-a3b-q4_K_M -> reasoning-heavy alternate
+#
+# ---------------------------------------------------------------------------
+# Context management policy
+# ---------------------------------------------------------------------------
+# This router uses Headroom as the primary context-management layer.
+#
+# Rules:
+#   - baseline compression runs on every request
+#   - proactive summarization must trigger as late as safely possible
+#   - early summarization is considered a failure mode
+#   - dropping/segment stripping is absolute last-resort overflow recovery only
+#
+# Effective input budget:
+#   effective_input_budget = num_ctx - reserved_output_tokens - safety_headroom_tokens
+#
+# Threshold policy used here:
+#   - standard text/code/reasoning models:
+#       proactive threshold = effective_input_budget - 512
+#   - vision models:
+#       proactive threshold = effective_input_budget - 1024
+#   - embedding models:
+#       proactive summarization disabled
+#
+# For the currently tuned Orin values, this yields:
+#   qwen3.6:35b-a3b      -> num_ctx 32768, threshold 24064
+#   qwen3-coder:30b      -> num_ctx 32768, threshold 24064
+#   qwen3:4b             -> num_ctx 32768, threshold 28160
+#   qwen3-vl:4b          -> num_ctx 24576, threshold 19456
+#   gemma4:12b           -> num_ctx 32768, threshold 24064
+#   gpt-oss:20b          -> num_ctx 24576, threshold 15872
+#   nemotron-cascade-2   -> num_ctx 24576, threshold 15872
+#
+# Zoo Code interaction note:
+#   Zoo should use the real model context windows from this file (no inflation).
+#   Context condensing requests are intercepted by the router and routed through
+#   the Headroom pipeline, so Zoo-native condensing logic does not preempt router
+#   context management.
+#
+# ---------------------------------------------------------------------------
+# Performance notes
+# ---------------------------------------------------------------------------
+# Orin policy favors practical residency and stable latency over headline context.
+# Use qwen3.6 as the reasoning/default model and qwen3-coder as the implementation
+# worker. Avoid inflating num_ctx beyond what is operationally sustainable on-device.
+
 models:
+  # Primary default model
+  # Use for:
+  #   - discovery of complexity
+  #   - standard coding
+  #   - planning
+  #   - debugging
+  #   - documentation
+  #   - review
   - model: qwen3.6:35b-a3b
     keep_alive: -1
     think: true
-    warmup: false
-    options:
-      num_ctx: 32768
-      num_batch: 512
-      temperature: 0.6
-      top_p: 0.95
-
-  - model: qwen3-embedding:4b
-    keep_alive: -1
-    think: false
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
     warmup: true
-    options:
-      num_ctx: 8192
-      num_batch: 256
-
-  - model: qwen3-coder:30b
-    keep_alive: 10m
-    think: false
-    warmup: false
-    options:
-      num_ctx: 65536
-      num_batch: 512
-      temperature: 0.1
-      top_p: 0.9
-      repeat_penalty: 1.05
-
-  - model: qwen3:4b
-    keep_alive: 10m
-    think: true
-    warmup: false
-    options:
-      num_ctx: 65536
-      num_batch: 512
-      temperature: 0.2
-      top_p: 0.9
-      repeat_penalty: 1.05
-
-  - model: qwen3-vl:4b
-    keep_alive: 10m
-    think: true
-    warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 24064
+    recovery_strategy: drop_oldest
     options:
       num_ctx: 65536
       num_batch: 256
-      temperature: 0.2
-      top_p: 0.9
-      repeat_penalty: 1.05
+      temperature: 0.18
+      top_p: 0.90
+      repeat_penalty: 1.03
 
-  - model: gemma4:12b
-    keep_alive: 10m
+  # A/B candidate for Python/MCP implementation work
+  # Coding-specialized variant for comparison with qwen3.6:35b-a3b
+  # MoE model with ~18-24 GB Q4_K_M weight size (fits in 64GB)
+  - model: qwen3.6:35b-a3b-coding
+    keep_alive: 15m
     think: true
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
     warmup: false
-    options:
-      num_ctx: 65536
-      num_batch: 256
-      temperature: 0.3
-      top_p: 0.95
-      repeat_penalty: 1.05
-
-  - model: nemotron-cascade-2:30b-a3b-q4_K_M
-    keep_alive: 10m
-    think: true
-    warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 24064
+    recovery_strategy: drop_oldest
     options:
       num_ctx: 65536
       num_batch: 256
@@ -72,12 +155,155 @@ models:
       top_p: 0.90
       repeat_penalty: 1.03
 
-  - model: gpt-oss:20b
+  # Primary code-search / indexing model
+  # Always hot because indexing/search is continuous.
+  - model: qwen3-embedding:4b
+    keep_alive: -1
+    think: false
+    warmup: true
+    reserved_output_tokens: 512
+    safety_headroom_tokens: 512
+    proactive_summarization_enabled: false
+    proactive_summarization_threshold_tokens: 0
+    recovery_strategy: drop_oldest
+    options:
+      num_ctx: 16384
+      num_batch: 256
+
+  # Direct-edit / no-think coding fallback
+  # Good when:
+  #   - the task is straightforward
+  #   - parser-stable output matters
+  #   - overbuilding must be minimized
+  - model: qwen3-coder:30b
+    keep_alive: 20m
+    think: false
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
+    warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 24064
+    recovery_strategy: summarize_history
+    options:
+      num_ctx: 65536
+      num_batch: 256
+      temperature: 0.10
+      top_p: 0.90
+      repeat_penalty: 1.05
+
+  # Compatibility model
+  - model: qwen3:4b
+    keep_alive: 10m
+    think: true
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
+    warmup: false
+    reserved_output_tokens: 2048
+    safety_headroom_tokens: 2048
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 28160
+    recovery_strategy: summarize_history
+    options:
+      num_ctx: 32768
+      num_batch: 384
+      temperature: 0.20
+      top_p: 0.90
+      repeat_penalty: 1.05
+
+  # Vision compatibility model
+  - model: qwen3-vl:4b
+    keep_alive: 20m
+    think: true
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
+    warmup: false
+    reserved_output_tokens: 2048
+    safety_headroom_tokens: 2048
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 19456
+    recovery_strategy: summarize_history
+    options:
+      num_ctx: 24576
+      num_batch: 192
+      temperature: 0.20
+      top_p: 0.90
+      repeat_penalty: 1.05
+
+  # Marginal model for Orin 64GB
+  # WARNING: qwen3.8:27b-q8_0 requires ~27 GB at Q8 quantization
+  # This leaves very little headroom for KV cache at long context lengths
+  # Recommended for short-context tasks only (< 16K tokens)
+  # For production use, prefer qwen3.6:35b-a3b or qwen3-coder:30b
+  - model: qwen3.8:27b-q8_0
+    keep_alive: 10m
+    think: true
+    tool_call_think: false
+    retry_on_tool_call_failure: true
+    retry_temperature: 0.1
+    warmup: false
+    reserved_output_tokens: 2048
+    safety_headroom_tokens: 2048
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 12000
+    recovery_strategy: drop_oldest
+    options:
+      num_ctx: 32768
+      num_batch: 192
+      temperature: 0.15
+      top_p: 0.90
+      repeat_penalty: 1.03
+
+  # Medium-size general alternative
+  - model: gemma4:12b
+    keep_alive: 20m
+    think: true
+    warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 24064
+    recovery_strategy: summarize_history
+    options:
+      num_ctx: 32768
+      num_batch: 256
+      temperature: 0.25
+      top_p: 0.95
+      repeat_penalty: 1.05
+
+  # Reasoning-heavy alternate
+  - model: nemotron-cascade-2:30b-a3b-q4_K_M
     keep_alive: 10m
     think: true
     warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 15872
+    recovery_strategy: summarize_history
     options:
-      num_ctx: 65536
+      num_ctx: 24576
+      num_batch: 192
+      temperature: 0.15
+      top_p: 0.90
+      repeat_penalty: 1.03
+
+  # Alternate reasoning / review model
+  - model: gpt-oss:20b
+    keep_alive: 15m
+    think: true
+    warmup: false
+    reserved_output_tokens: 4096
+    safety_headroom_tokens: 4096
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 15872
+    recovery_strategy: summarize_history
+    options:
+      num_ctx: 24576
       num_batch: 256
       temperature: 0.20
       top_p: 0.95
@@ -87,9 +313,28 @@ models:
     keep_alive: 10m
     think: true
     warmup: false
+    reserved_output_tokens: 2048
+    safety_headroom_tokens: 2048
+    proactive_summarization_enabled: true
+    proactive_summarization_threshold_tokens: 15000
+    recovery_strategy: drop_oldest_then_summarize
     options:
       num_ctx: 65536
       num_batch: 256
       temperature: 0.10
       top_p: 0.90
       repeat_penalty: 1.03
+
+# ---------------------------------------------------------------------------
+# Excluded models (intentionally not available on Orin 64GB)
+# ---------------------------------------------------------------------------
+# qwen3-coder-next:q4_K_M
+#   - 80B parameter model requires ~52 GB VRAM at Q4_K_M
+#   - Exceeds Orin's 64GB unified memory budget with safe headroom
+#   - Available on Thor (128GB) for direct-edit / parser-stable workloads
+#
+# qwen3.8:27b-bf16
+#   - 27B parameter model requires ~54 GB at BF16 precision
+#   - Leaves only ~10 GB for KV cache + system on Orin 64GB
+#   - Effectively unusable for production workloads
+#   - Available on Thor (128GB) for high-quality reasoning tasks

@@ -251,8 +251,8 @@ The router uses [headroom-ai](https://github.com/headroomlabs-ai/headroom) as an
 2. Constructs complete Ollama payload
 3. Calls `headroom.compress(messages, model=..., config=_HEADROOM_CONFIG)` once on finalized message list with explicit `CompressConfig` (`compress_system_messages=False`)
 4. Validates tool_calls integrity via `_validate_tool_integrity()` after compression; falls back to original messages if validation fails
-5. Checks compressed prompt against configured context window with reserved output and safety tokens
-6. Rejects if compressed prompt still cannot fit (no silent history discard)
+5. Sends to Ollama; on context-overflow HTTP 400, runs bounded recovery ladder
+6. Retries only after material reductions; propagates upstream error when no safe reduction is possible
 
 ### API Contract
 
@@ -268,6 +268,17 @@ The router calls `headroom.compress()` with:
 Each model in `models.yaml` defines:
 - `reserved_output_tokens`: Tokens reserved for generation output (e.g., `4096`)
 - `safety_headroom_tokens`: Extra buffer for unexpected tokens (e.g., `4096`)
+- `trim_strategy`: Legacy fallback trim strategy (used only when ladder-v2 flag is disabled)
+
+Recovery ladder behavior is controlled through router environment flags:
+- `HEADROOM_RECOVERY_LADDER_V2`
+- `HEADROOM_RECOVERY_ENABLE_STAGE_B`
+- `HEADROOM_RECOVERY_ENABLE_STAGE_C`
+- `HEADROOM_RECOVERY_ENABLE_STAGE_D`
+- `HEADROOM_RECOVERY_MAX_RETRIES`
+- `HEADROOM_RECOVERY_MIN_TOKEN_DELTA`
+- `HEADROOM_RECOVERY_MIN_STRIP_TOKEN_DELTA`
+- `HEADROOM_RECOVERY_MIN_SEGMENTS_TO_KEEP`
 
 ---
 

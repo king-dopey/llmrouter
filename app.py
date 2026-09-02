@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import json
 import os
@@ -14,8 +15,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
 
-from policy import load_think_policy_config, parse_think_override, should_enable_think
-from router_headroom import check_and_trim
+from policy import load_think_policy_config, parse_think_override, should_enable_think, _detect_tool_call_failure
+from router_headroom import (
+    apply_overflow_recovery,
+    check_and_trim,
+    is_context_overflow_error,
+    maybe_apply_proactive_summarization,
+)
 from retrieval import RetrievedChunk, format_retrieval_context, retrieve_context
 
 # Add lock for preventing concurrent pulls of the same model
@@ -48,6 +54,14 @@ def _safe_error_response(exc: Exception, operation: str) -> dict:
         }
     }
 
+
+async def _resolve_stream_context(client: Any, *args: Any, **kwargs: Any):
+    """Resolve mocked or real async stream objects before entering the context."""
+    stream_obj = client.stream(*args, **kwargs)
+    if inspect.isawaitable(stream_obj):
+        stream_obj = await stream_obj
+    return stream_obj
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
 ASR_BASE_URL_ENV = os.getenv("ASR_BASE_URL", "").rstrip("/")
 ASR_PORT = int(os.getenv("ASR_PORT", "8000"))
@@ -62,6 +76,20 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "repo_chunks")
 QDRANT_EMBEDDING_MODEL = os.getenv("QDRANT_EMBEDDING_MODEL", "nomic-embed-text")
 QDRANT_TOP_K = int(os.getenv("QDRANT_TOP_K", "20"))
 QDRANT_FINAL_K = int(os.getenv("QDRANT_FINAL_K", "8"))
+try:
+    HEADROOM_RECOVERY_MAX_RETRIES = max(0, int(os.getenv("HEADROOM_RECOVERY_MAX_RETRIES", "1")))
+except ValueError:
+    HEADROOM_RECOVERY_MAX_RETRIES = 1
+
+
+ZOO_CONTEXT_CONDENSE_TRIGGER = (
+    os.getenv(
+        "ZOO_CONTEXT_CONDENSE_TRIGGER",
+        "ZOO_CONTEXT_CONDENSE_V1: delegate context condensing to router headroom pipeline.",
+    )
+    .strip()
+)
+ZOO_CONTEXT_CONDENSE_TRIGGER_TOKEN = "zoo_context_condense_v1"
 
 def _translate_tool_calls(ollama_tool_calls):
     """Convert Ollama-shape tool_calls to OpenAI-shape.
@@ -387,6 +415,9 @@ def _load_policy() -> dict[str, dict[str, Any]]:
                     continue
                 keep_alive = _parse_scalar(item.get("keep_alive"))
                 think = item.get("think")
+                tool_call_think = item.get("tool_call_think")
+                retry_on_tool_call_failure = item.get("retry_on_tool_call_failure", False)
+                retry_temperature = item.get("retry_temperature", 0.1)
                 options = item.get("options") or {}
                 if not isinstance(options, dict):
                     logger.warning("policy: ignoring non-dict options for %s", model_name)
@@ -394,12 +425,15 @@ def _load_policy() -> dict[str, dict[str, Any]]:
                 table[model_name] = {
                     "keep_alive": keep_alive,
                     "think": bool(think) if think is not None else True,
+                    "tool_call_think": bool(tool_call_think) if tool_call_think is not None else None,
+                    "retry_on_tool_call_failure": bool(retry_on_tool_call_failure),
+                    "retry_temperature": float(retry_temperature),
                     "options": {k: _parse_scalar(v) for k, v in options.items()},
                     "warmup": bool(item.get("warmup", False)),
                     "reserved_output_tokens": _parse_scalar(item.get("reserved_output_tokens", 2048)),
                     "safety_headroom_tokens": _parse_scalar(item.get("safety_headroom_tokens", 2048)),
-                    "trim_strategy": item.get("trim_strategy", "drop_oldest"),
-                    "allow_auto_pull": bool(item.get("allow_auto_pull", True)),
+                    "proactive_summarization_enabled": bool(item.get("proactive_summarization_enabled", False)),
+                    "proactive_summarization_threshold_tokens": _parse_scalar(item.get("proactive_summarization_threshold_tokens", 0)),
                 }
             if table:
                 return table
@@ -642,6 +676,69 @@ async def pull_model(model_name: str) -> bool:
             return False
 
 
+async def _ollama_model_is_evicted(model_name: str) -> bool:
+    """Return True when Ollama no longer reports the requested model as loaded.
+
+    This detects the evicted-model case that leaves a stream stalled while the router
+    is waiting for upstream output with no HTTP error from Ollama.
+    """
+    if not model_name:
+        return False
+    try:
+        timeout = httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"{OLLAMA_BASE_URL}/api/ps")
+            response.raise_for_status()
+            data = response.json()
+            models = data.get("models") or []
+            if not models:
+                logger.warning("Ollama /api/ps reports no loaded models while stream for %s is stalled", model_name)
+                return True
+            loaded_names: list[str] = []
+            for model in models:
+                if isinstance(model, dict):
+                    name = model.get("name") or model.get("model")
+                    if name:
+                        loaded_names.append(str(name))
+                elif isinstance(model, str):
+                    loaded_names.append(model)
+            if model_name not in loaded_names:
+                logger.warning(
+                    "Stream for %s stalled because the model is no longer loaded; loaded models=%s",
+                    model_name,
+                    loaded_names,
+                )
+                return True
+            return False
+    except Exception as exc:
+        logger.debug("Failed to inspect Ollama /api/ps for stalled stream on %s: %s", model_name, exc)
+        try:
+            timeout = httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+                response.raise_for_status()
+                data = response.json()
+                models = data.get("models") or []
+                model_names: list[str] = []
+                for model in models:
+                    if isinstance(model, dict):
+                        name = model.get("name") or model.get("model")
+                        if name:
+                            model_names.append(str(name))
+                    elif isinstance(model, str):
+                        model_names.append(model)
+                if model_name not in model_names:
+                    logger.warning(
+                        "Ollama /api/tags does not list %s while stream is stalled; available models=%s",
+                        model_name,
+                        model_names,
+                    )
+                    return True
+        except Exception as tags_exc:
+            logger.debug("Failed to inspect Ollama /api/tags for stalled stream on %s: %s", model_name, tags_exc)
+        return False
+
+
 async def _preflight_model(model_name: str) -> bool:
     """Perform preflight validation and ensure model is available."""
     logger.info("Preflight check for model %s", model_name)
@@ -653,8 +750,20 @@ async def _preflight_model(model_name: str) -> bool:
     
     # Check if model is in policy
     if model_name not in MODEL_POLICY:
-        logger.warning("Model %s not in policy, rejecting request", model_name)
-        return False
+        supported_models = ", ".join(sorted(MODEL_POLICY.keys())) or "<none>"
+        logger.warning(
+            "Model %s not in active policy file %s; supported models=%s",
+            model_name,
+            POLICY_FILE,
+            supported_models,
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"model '{model_name}' is not enabled by the active policy in "
+                f"{os.path.basename(POLICY_FILE)}; supported models: {supported_models}"
+            ),
+        )
 
     local_models = await list_local_models()
     if local_models is None:
@@ -729,6 +838,247 @@ def _content_part_to_text(part: Any) -> str:
     if isinstance(part.get("content"), list):
         return "".join(_content_part_to_text(p) for p in part["content"])
     return ""
+
+
+def _message_content_to_text(content: Any) -> str:
+    """Normalize OpenAI/Anthropic-style content payloads into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(_content_part_to_text(part) for part in content)
+    if isinstance(content, dict):
+        return _content_part_to_text(content)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _is_zoo_condense_trigger_text(text: str) -> bool:
+    """Detect canonical Zoo context-condense trigger payloads."""
+    if not text:
+        return False
+    lowered = text.lower()
+    if ZOO_CONTEXT_CONDENSE_TRIGGER_TOKEN in lowered:
+        return True
+    if ZOO_CONTEXT_CONDENSE_TRIGGER and ZOO_CONTEXT_CONDENSE_TRIGGER.lower() in lowered:
+        return True
+    return False
+
+
+def _is_zoo_condense_request(messages: list[dict[str, Any]]) -> bool:
+    """Return True when a request is Zoo-native context condensing."""
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "")
+        if role not in {"system", "user"}:
+            continue
+        text = _message_content_to_text(msg.get("content"))
+        if _is_zoo_condense_trigger_text(text):
+            return True
+    return False
+
+
+def _remove_zoo_condense_trigger_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip condense-trigger messages so only real conversation context is compacted."""
+    filtered: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if _is_zoo_condense_trigger_text(_message_content_to_text(msg.get("content"))):
+            continue
+        filtered.append(msg)
+    return filtered
+
+
+def _render_zoo_condensed_context(messages: list[dict[str, Any]], max_chars: int = 12000) -> str:
+    """Render compacted conversation into deterministic text Zoo can store as condensed context."""
+    lines: list[str] = ["CONDENSED_CONTEXT_V1"]
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "unknown")
+        role_header = role
+        if role == "tool" and msg.get("tool_call_id"):
+            role_header = f"tool[{msg.get('tool_call_id')}]"
+        lines.append(f"[{role_header}]")
+
+        content = (msg.get("content") or "")
+        if not isinstance(content, str):
+            content = str(content)
+        content = content.strip()
+        if content:
+            lines.append(content)
+
+        tool_calls = msg.get("tool_calls") or []
+        if isinstance(tool_calls, list) and tool_calls:
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                fn_name = fn.get("name", "")
+                lines.append(f"tool_call: {fn_name}")
+
+    text = "\n".join(lines).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 20].rstrip() + "\n[truncated]"
+
+
+def _build_condense_usage(
+    model: str,
+    prompt_messages: list[dict[str, Any]],
+    completion_text: str,
+) -> dict[str, int]:
+    prompt_tokens = int(tokenizer.count_prompt_tokens(prompt_messages, model) or 0)
+    completion_tokens = int(tokenizer.count_completion_tokens(completion_text, model) or 0)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+
+
+def _build_condense_streaming_response(
+    *,
+    completion_id: str,
+    created: int,
+    model: str,
+    condensed_text: str,
+    usage: dict[str, int],
+    include_stream_usage: bool,
+) -> StreamingResponse:
+    async def _stream():
+        first_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(first_chunk)}\n\n"
+
+        content_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": condensed_text},
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(content_chunk)}\n\n"
+
+        if include_stream_usage:
+            usage_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
+            yield f"data: {json.dumps(usage_chunk)}\n\n"
+
+        end_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+        }
+        yield f"data: {json.dumps(end_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+def _build_condense_completion_response(
+    *,
+    completion_id: str,
+    created: int,
+    model: str,
+    condensed_text: str,
+    usage: dict[str, int],
+    stream: bool,
+    include_stream_usage: bool,
+) -> JSONResponse | StreamingResponse:
+    if stream:
+        return _build_condense_streaming_response(
+            completion_id=completion_id,
+            created=created,
+            model=model,
+            condensed_text=condensed_text,
+            usage=usage,
+            include_stream_usage=include_stream_usage,
+        )
+
+    return JSONResponse(
+        {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": condensed_text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": usage,
+        }
+    )
+
+
+def _run_headroom_condense_pipeline(
+    *,
+    model_name: str,
+    messages: list[dict[str, Any]],
+    policy_entry: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Apply the router's headroom compaction/recovery pipeline for condensing requests."""
+    normalized_messages = _normalize_messages(messages)
+    headroom_messages = _serialize_tool_arguments_for_headroom(normalized_messages)
+
+    try:
+        proactive_result = maybe_apply_proactive_summarization(
+            headroom_messages,
+            model_name,
+            policy_entry,
+        )
+        if proactive_result.triggered:
+            headroom_messages = proactive_result.messages
+    except RuntimeError as exc:
+        logger.warning(
+            "router: proactive summarization failed during condense interception for model=%s: %s",
+            model_name,
+            exc,
+        )
+
+    headroom_result = check_and_trim(headroom_messages, model_name, policy_entry)
+    if headroom_result.rejected:
+        raise HTTPException(status_code=413, detail=headroom_result.error_response)
+    condensed_messages = list(headroom_result.messages or [])
+
+    recovery_result = apply_overflow_recovery(condensed_messages, model_name, policy_entry)
+    if recovery_result.changed:
+        condensed_messages = recovery_result.messages
+
+    return condensed_messages
 
 
 def _coerce_tool_arguments(args: Any) -> dict:
@@ -1040,6 +1390,165 @@ def _build_ollama_payload(body: dict[str, Any], think: bool) -> dict[str, Any]:
         payload["format"] = body["format"]
     return payload
 
+
+def _extract_tool_names(body: dict[str, Any]) -> list[str]:
+    """Extract tool names from request body for retry detection.
+
+    Args:
+        body: Request body containing 'tools' array
+
+    Returns:
+        List of tool function names (empty list if no tools or invalid structure)
+    """
+    tool_names: list[str] = []
+    for tool in body.get("tools", []):
+        if isinstance(tool, dict) and "function" in tool:
+            fn = tool["function"]
+            if isinstance(fn, dict) and "name" in fn:
+                tool_names.append(fn["name"])
+    return tool_names
+
+
+def _should_retry_tool_call(body: dict[str, Any], model_entry: dict[str, Any]) -> bool:
+    """Check if retry guard should be evaluated for this request.
+
+    This encapsulates the precondition check: retry is enabled for this model
+    AND the request includes tools. The caller must still check whether tool_calls
+    were actually produced in the response.
+
+    Args:
+        body: Request body
+        model_entry: Model configuration from MODEL_POLICY
+
+    Returns:
+        True if retry guard preconditions are met, False otherwise
+    """
+    retry_enabled = model_entry.get("retry_on_tool_call_failure", False)
+    has_tools = bool(body.get("tools"))
+    return retry_enabled and has_tools
+
+
+async def _perform_tool_call_retry(
+    body: dict[str, Any],
+    model_name: str,
+    model_entry: dict[str, Any],
+    original_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Perform one-shot retry with think:false and low temperature.
+    
+    This is called when a model returns assistant text mentioning a tool but fails
+    to produce structured tool_calls. The retry removes the invalid assistant response
+    and forces think:false with low temperature to encourage proper tool call formatting.
+    
+    Args:
+        body: Original request body
+        model_name: Model name
+        model_entry: Model configuration from MODEL_POLICY
+        original_payload: Original Ollama payload (for reference)
+    
+    Returns:
+        dict with keys:
+        - success: bool indicating if retry succeeded
+        - result: dict containing the retry response (if success=True)
+        - error: str containing error message (if success=False)
+    """
+    logger.info("router: initiating tool-call retry for model=%s", model_name)
+    
+    # Remove the invalid assistant response from message history
+    retry_messages = []
+    for msg in body.get("messages", []):
+        if msg.get("role") == "assistant":
+            # Skip the last assistant message that failed to produce tool_calls
+            continue
+        retry_messages.append(msg)
+    
+    # Build retry body with cleaned messages
+    retry_body = {
+        "model": model_name,
+        "messages": retry_messages,
+        "tools": body.get("tools"),
+        "tool_choice": body.get("tool_choice"),
+        "stream": False,  # Retry is always non-streaming
+    }
+    
+    # Force think:false and low temperature for retry
+    retry_temperature = model_entry.get("retry_temperature", 0.1)
+    
+    try:
+        # Build payload with forced settings
+        retry_payload = _build_ollama_payload(retry_body, think=False)
+        
+        # Override temperature in options
+        if "options" not in retry_payload:
+            retry_payload["options"] = {}
+        retry_payload["options"]["temperature"] = retry_temperature
+        
+        logger.info(
+            "router: retry payload model=%s think=false temperature=%.2f messages=%d",
+            model_name,
+            retry_temperature,
+            len(retry_messages),
+        )
+        
+        # Make the retry request
+        response = await _ollama_post("/api/chat", retry_payload, stream=False)
+        
+        if response.status_code >= 400:
+            error_text = response.text[:500]
+            logger.error(
+                "router: tool-call retry failed model=%s status=%d error=%s",
+                model_name,
+                response.status_code,
+                error_text,
+            )
+            return {
+                "success": False,
+                "result": None,
+                "error": f"Retry request failed with status {response.status_code}: {error_text}",
+            }
+        
+        result = response.json()
+        
+        # Check if retry produced tool_calls
+        ollama_message = result.get("message") or {}
+        tool_calls = _translate_tool_calls(ollama_message.get("tool_calls") or [])
+        
+        if tool_calls:
+            logger.info(
+                "router: tool-call retry succeeded model=%s tool_calls=%d",
+                model_name,
+                len(tool_calls),
+            )
+            return {
+                "success": True,
+                "result": result,
+                "error": None,
+            }
+        else:
+            logger.warning(
+                "router: tool-call retry did not produce tool_calls model=%s",
+                model_name,
+            )
+            return {
+                "success": False,
+                "result": result,
+                "error": "Retry did not produce tool_calls",
+            }
+    
+    except Exception as e:
+        logger.error(
+            "router: tool-call retry exception model=%s error=%s",
+            model_name,
+            str(e),
+            exc_info=True,
+        )
+        return {
+            "success": False,
+            "result": None,
+            "error": f"Retry exception: {str(e)}",
+        }
+
+
 async def _ollama_post(path: str, payload: dict, stream: bool = False,):
     """POST to Ollama with timeouts appropriate for local LLM generation.
 
@@ -1102,6 +1611,45 @@ async def chat_completions(request: Request):
 
     model_name = body.get("model")
     logger.debug("Requested model: %s", model_name)
+
+    body = dict(body)
+    body_messages = body.get("messages") or []
+    stream_options = body.get("stream_options") or {}
+    include_stream_usage = bool(stream_options.get("include_usage", False))
+
+    if isinstance(body_messages, list) and _is_zoo_condense_request(body_messages):
+        if not model_name:
+            raise HTTPException(status_code=400, detail="'model' is required")
+
+        logger.info(
+            "router: intercepted zoo context condense request for model=%s using trigger=%s",
+            model_name,
+            ZOO_CONTEXT_CONDENSE_TRIGGER_TOKEN,
+        )
+        policy_entry = MODEL_POLICY.get(model_name, {})
+        source_messages = _remove_zoo_condense_trigger_messages(body_messages)
+        if not source_messages:
+            source_messages = body_messages
+
+        condensed_messages = _run_headroom_condense_pipeline(
+            model_name=model_name,
+            messages=source_messages,
+            policy_entry=policy_entry,
+        )
+        condensed_text = _render_zoo_condensed_context(condensed_messages)
+
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        usage = _build_condense_usage(model_name, condensed_messages, condensed_text)
+        return _build_condense_completion_response(
+            completion_id=completion_id,
+            created=created,
+            model=model_name,
+            condensed_text=condensed_text,
+            usage=usage,
+            stream=bool(body.get("stream", False)),
+            include_stream_usage=include_stream_usage,
+        )
     
     # Perform preflight check
     logger.info("Starting preflight check for model %s", model_name)
@@ -1118,34 +1666,48 @@ async def chat_completions(request: Request):
     
     logger.info("Preflight check passed for model %s", model_name)
 
-    model_default_think = MODEL_POLICY.get(model_name, {}).get("think", True)
+    model_entry = MODEL_POLICY.get(model_name, {})
+    model_default_think = model_entry.get("think", True)
+    tool_call_think = model_entry.get("tool_call_think")
     think = should_enable_think(
         body=body,
         override=think_override,
         config=THINK_POLICY_CONFIG,
         default_think=model_default_think,
+        model_name=model_name or "",
+        tool_call_think=tool_call_think,
     )
-    body = dict(body)
-    body_messages = body.get("messages") or []
     if isinstance(body_messages, list):
         body["messages"] = await _inject_retrieval_context(body, body_messages)
 
     payload = _build_ollama_payload(body, think=think)
-    stream_options = body.get("stream_options") or {}
-    include_stream_usage = bool(stream_options.get("include_usage", False))
 
     policy_entry = MODEL_POLICY.get(model_name, {})
     
     # Serialize tool arguments for Headroom compression (converts dicts to JSON strings)
     headroom_messages = _serialize_tool_arguments_for_headroom(payload["messages"])
-    
+
+    try:
+        proactive_result = maybe_apply_proactive_summarization(headroom_messages, model_name, policy_entry)
+        if proactive_result.triggered:
+            logger.info(
+                "router: proactive summarization model=%s before=%s after=%s reason=%s",
+                model_name,
+                proactive_result.tokens_before,
+                proactive_result.tokens_after,
+                proactive_result.reason,
+            )
+            headroom_messages = proactive_result.messages
+    except RuntimeError as exc:
+        logger.warning("router: proactive summarization failed for model=%s: %s", model_name, exc)
+
     try:
         headroom_result = check_and_trim(headroom_messages, model_name, policy_entry)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if headroom_result.rejected:
         raise HTTPException(status_code=413, detail=headroom_result.error_response)
-    
+
     # Headroom returns messages with JSON string arguments; _deserialize_tool_arguments()
     # in router_headroom.py converts them back to dicts for Ollama compatibility.
     payload["messages"] = headroom_result.messages
@@ -1165,7 +1727,6 @@ async def chat_completions(request: Request):
         
         async def event_stream():
             logger.debug("Starting streaming response for model %s", model)
-            # Opening role chunk so clients see structure immediately.
             first_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -1177,7 +1738,6 @@ async def chat_completions(request: Request):
                     "finish_reason": None,
                 }],
             }
-            yield f"data: {json.dumps(first_chunk)}\n\n"
 
             # Single queue feeds the generator. Heartbeat task pushes
             # keepalive comments; reader task pushes real SSE frames.
@@ -1204,123 +1764,91 @@ async def chat_completions(request: Request):
                     timeout = httpx.Timeout(
                         connect=10.0, read=1800.0, write=30.0, pool=30.0
                     )
-                    async with httpx.AsyncClient(timeout=timeout) as client:
-                        async with client.stream(
-                            "POST",
-                            f"{OLLAMA_BASE_URL}/api/chat",
-                            json=payload,
-                        ) as resp:
-                            logger.debug("Ollama /api/chat streaming response status: %d", resp.status_code)
-                            if resp.status_code >= 400:
-                                # Check if this is a 404 for a policy model that should be pulled
+
+                    stream_state = {
+                        "request_id": completion_id,
+                        "model_name": model_name,
+                        "opened_at": time.time(),
+                        "last_progress_at": None,
+                        "retry_count": 0,
+                        "stream_state": "opening",
+                        "finalized": False,
+                    }
+
+                    def mark_progress(state: str) -> None:
+                        stream_state["stream_state"] = state
+                        stream_state["last_progress_at"] = time.time()
+                    
+                    # Context overflow recovery: bounded retries after successful reductions.
+                    max_context_retries = HEADROOM_RECOVERY_MAX_RETRIES
+                    context_retry_count = 0
+                    eviction_retry_count = 0
+
+                    while True:
+                        async with httpx.AsyncClient(timeout=timeout) as client:
+                            stream_obj = await _resolve_stream_context(
+                                client,
+                                "POST",
+                                f"{OLLAMA_BASE_URL}/api/chat",
+                                json=payload,
+                            )
+                            async with stream_obj as resp:
+                                logger.debug("Ollama /api/chat streaming response status: %d", resp.status_code)
+
+                                # Handle 404 for policy models (existing logic)
                                 if resp.status_code == 404:
                                     try:
                                         error_text = (await resp.aread()).decode("utf-8", errors="ignore")
                                         if "not found" in error_text and model_name in MODEL_POLICY:
                                             logger.info("Received 404 for model %s in streaming, attempting one-time recovery pull", model_name)
-                                            # Try to pull the model again and retry once
                                             if await _preflight_model(model_name):
                                                 logger.info("Recovery pull successful, retrying Ollama request for %s", model_name)
-                                                # Note: We can't easily retry the streaming request, so we'll just return the error
-                                                # This is a limitation of the streaming approach - the original request has already started
-                                                logger.warning("Recovery pull succeeded but streaming request cannot be retried")
                                     except Exception:
-                                        # If we can't parse the error or recovery fails, continue with original error
                                         pass
 
-                                error_text = (await resp.aread()).decode(
-                                    "utf-8", errors="ignore"
-                                )
-                                error_response = _safe_error_response(
-                                    Exception(f"Ollama upstream error status={resp.status_code}: {error_text[:500]}"),
-                                    "streaming: Ollama upstream"
-                                )
-                                err_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {},
-                                        "finish_reason": "error",
-                                    }],
-                                    "error": {
-                                        "message": error_response["error"]["message"],
-                                        "type": error_response["error"]["type"],
-                                        "code": error_response["error"]["code"],
-                                    },
-                                }
-                                await queue.put(
-                                    f"data: {json.dumps(err_chunk)}\n\n"
-                                )
-                                return
+                                # Handle context overflow with recovery trim (new pipeline)
+                                if resp.status_code >= 400:
+                                    error_text = (await resp.aread()).decode("utf-8", errors="ignore")
+                                    if is_context_overflow_error(resp.status_code, error_text):
+                                        context_retry_count += 1
+                                        if context_retry_count <= max_context_retries:
+                                            logger.warning(
+                                                "Context overflow detected in streaming for model %s (status=%d), applying recovery trim and retrying (attempt %d/%d)",
+                                                model_name,
+                                                resp.status_code,
+                                                context_retry_count,
+                                                max_context_retries,
+                                            )
+                                            try:
+                                                recovery_result = apply_overflow_recovery(
+                                                    payload["messages"], model_name, policy_entry
+                                                )
+                                                trimmed_messages = recovery_result.messages
+                                                was_trimmed = recovery_result.changed
+                                                logger.info(
+                                                    "Overflow recovery streaming model=%s stage=%s attempts=%d changed=%s success_candidate=%s",
+                                                    model_name,
+                                                    recovery_result.final_stage,
+                                                    len(recovery_result.attempts),
+                                                    recovery_result.changed,
+                                                    recovery_result.success_candidate,
+                                                )
+                                                if was_trimmed:
+                                                    logger.info("Overflow recovery applied for streaming model %s, retrying with %d messages", model_name, len(trimmed_messages))
+                                                    payload["messages"] = trimmed_messages
+                                                    continue  # retry the while loop
+                                                logger.warning("Overflow recovery did not reduce messages for streaming model %s; propagating upstream error", model_name)
+                                            except Exception as trim_exc:
+                                                logger.error("Overflow recovery failed for streaming model %s: %s", model_name, trim_exc, exc_info=True)
 
-                            saw_tool_calls = False
-                            async for line in resp.aiter_lines():
-                                if not line.strip():
-                                    continue
-                                data = json.loads(line)
-                                message = data.get("message") or {}
-
-                                # Tool-call delta translation.
-                                raw_tool_calls = message.get("tool_calls") or []
-                                tc_deltas = _streaming_tool_call_deltas(raw_tool_calls)
-                                if tc_deltas:
-                                    saw_tool_calls = True
-                                    tc_chunk = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"tool_calls": tc_deltas},
-                                            "finish_reason": None,
-                                        }],
-                                    }
-                                    await queue.put(
-                                        f"data: {json.dumps(tc_chunk)}\n\n"
+                                # Any other error (or context retry exhausted): emit error chunk and return
+                                if resp.status_code >= 400:
+                                    error_text = (await resp.aread()).decode("utf-8", errors="ignore")
+                                    error_response = _safe_error_response(
+                                        Exception(f"Ollama upstream error status={resp.status_code}: {error_text[:500]}"),
+                                        "streaming: Ollama upstream"
                                     )
-
-                                # Plain content delta.
-                                token = message.get("content", "")
-                                if token:
-                                    chunk = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": token},
-                                            "finish_reason": None,
-                                        }],
-                                    }
-                                    await queue.put(
-                                        f"data: {json.dumps(chunk)}\n\n"
-                                    )
-
-                                if data.get("done"):
-                                    usage_chunk = _build_stream_usage_chunk(
-                                        include_usage=include_stream_usage,
-                                        completion_id=completion_id,
-                                        created=created,
-                                        model=model,
-                                        done_data=data,
-                                    )
-                                    if usage_chunk is not None:
-                                        await queue.put(f"data: {json.dumps(usage_chunk)}\n\n")
-
-                                    if saw_tool_calls:
-                                        finish_reason = "tool_calls"
-                                    else:
-                                        dr = data.get("done_reason")
-                                        finish_reason = (
-                                            dr if dr in ("stop", "length", "content_filter")
-                                            else "stop"
-                                        )
-                                    end_chunk = {
+                                    err_chunk = {
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
                                         "created": created,
@@ -1328,16 +1856,276 @@ async def chat_completions(request: Request):
                                         "choices": [{
                                             "index": 0,
                                             "delta": {},
-                                            "finish_reason": finish_reason,
+                                            "finish_reason": "error",
                                         }],
+                                        "error": {
+                                            "message": error_response["error"]["message"],
+                                            "type": error_response["error"]["type"],
+                                            "code": error_response["error"]["code"],
+                                        },
                                     }
                                     await queue.put(
-                                        f"data: {json.dumps(end_chunk)}\n\n"
+                                        f"data: {json.dumps(err_chunk)}\n\n"
                                     )
-                                    await queue.put("data: [DONE]\n\n")
-                                    break
+                                    logger.debug("streaming: emitted error chunk (early error path)")
+                                    if not stream_state.get("finalized"):
+                                        await queue.put("data: [DONE]\n\n")
+                                        stream_state["finalized"] = True
+                                        logger.debug("streaming: emitted [DONE] terminator (early error path)")
+                                    return
+
+                                retry_stream = False
+                                saw_tool_calls = False
+                                saw_assistant_payload = False
+                                first_line_seen = False
+                                streaming_content_chunks = []  # Track content for retry detection
+                                line_iter = resp.aiter_lines()
+                                while True:
+                                    try:
+                                        line = await anext(line_iter)
+                                    except StopAsyncIteration as exc:
+                                        if await _ollama_model_is_evicted(model_name):
+                                            stream_state["stream_state"] = "ended_evicted_before_completion"
+                                            if not first_line_seen and eviction_retry_count < 1:
+                                                eviction_retry_count += 1
+                                                retry_stream = True
+                                                logger.warning(
+                                                    "Detected silent-start eviction for model %s before any output; retrying once after preflight",
+                                                    model_name,
+                                                )
+                                                await _preflight_model(model_name)
+                                                break
+                                            logger.warning(
+                                                "Ollama stream for model %s ended before completion because the model was evicted or unloaded",
+                                                model_name,
+                                            )
+                                            raise TimeoutError(
+                                                f"Ollama stream for model {model_name} ended without completion because the model was evicted or unloaded"
+                                            ) from exc
+                                        stream_state["stream_state"] = (
+                                            "ended_before_progress"
+                                            if stream_state["stream_state"] == "opening"
+                                            else "ended_without_completion"
+                                        )
+                                        raise RuntimeError(
+                                            f"Ollama stream for model {model_name} ended without producing a completion or error"
+                                        ) from exc
+
+                                    if not line or not str(line).strip():
+                                        continue
+                                    if str(line).startswith(":"):
+                                        continue
+                                    if not first_line_seen:
+                                        mark_progress("generating")
+                                        await queue.put(f"data: {json.dumps(first_chunk)}\n\n")
+                                        first_line_seen = True
+                                    data = json.loads(line)
+                                    message = data.get("message") or {}
+
+                                    # Tool-call delta translation.
+                                    raw_tool_calls = message.get("tool_calls") or []
+                                    tc_deltas = _streaming_tool_call_deltas(raw_tool_calls)
+                                    if tc_deltas:
+                                        saw_tool_calls = True
+                                        saw_assistant_payload = True
+                                        mark_progress("tool_calls")
+                                        tc_chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {"tool_calls": tc_deltas},
+                                                "finish_reason": None,
+                                            }],
+                                        }
+                                        await queue.put(
+                                            f"data: {json.dumps(tc_chunk)}\n\n"
+                                        )
+
+                                    # Plain content delta.
+                                    token = message.get("content", "")
+                                    if token:
+                                        saw_assistant_payload = True
+                                        mark_progress("content")
+                                        streaming_content_chunks.append(token)  # Track for retry detection
+                                        chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {"content": token},
+                                                "finish_reason": None,
+                                            }],
+                                        }
+                                        await queue.put(
+                                            f"data: {json.dumps(chunk)}\n\n"
+                                        )
+
+                                    if data.get("done"):
+                                        logger.debug("streaming: received done:true from upstream model=%s", model_name)
+                                        if not saw_assistant_payload:
+                                            raise RuntimeError(
+                                                f"Ollama stream for model {model_name} completed without any assistant content or tool calls"
+                                            )
+                                        
+                                        # Check for tool-call retry condition
+                                        model_entry = MODEL_POLICY.get(model_name, {})
+                                        
+                                        if _should_retry_tool_call(body, model_entry) and not saw_tool_calls:
+                                            # Accumulate content and check for tool mentions
+                                            streaming_content = "".join(streaming_content_chunks)
+                                            tool_names = _extract_tool_names(body)
+                                            
+                                            if _detect_tool_call_failure(streaming_content, tool_names, False):
+                                                logger.info(
+                                                    "router: streaming tool-call failure detected model=%s content_mentions_tool=true",
+                                                    model_name,
+                                                )
+                                                
+                                                # Perform retry
+                                                retry_result = await _perform_tool_call_retry(
+                                                    body=body,
+                                                    model_name=model_name,
+                                                    model_entry=model_entry,
+                                                    original_payload=payload,
+                                                )
+                                                
+                                                if retry_result["success"]:
+                                                    # Emit retry result as streaming chunks
+                                                    retry_message = retry_result["result"].get("message", {})
+                                                    retry_content = retry_message.get("content", "")
+                                                    retry_tool_calls = _translate_tool_calls(retry_message.get("tool_calls") or [])
+                                                    
+                                                    # Emit content chunk
+                                                    if retry_content:
+                                                        content_chunk = {
+                                                            "id": completion_id,
+                                                            "object": "chat.completion.chunk",
+                                                            "created": created,
+                                                            "model": model,
+                                                            "choices": [{
+                                                                "index": 0,
+                                                                "delta": {"content": retry_content},
+                                                                "finish_reason": None,
+                                                            }],
+                                                        }
+                                                        await queue.put(f"data: {json.dumps(content_chunk)}\n\n")
+                                                    
+                                                    # Emit tool calls chunk
+                                                    if retry_tool_calls:
+                                                        tc_deltas = _streaming_tool_call_deltas(retry_tool_calls)
+                                                        if tc_deltas:
+                                                            tc_chunk = {
+                                                                "id": completion_id,
+                                                                "object": "chat.completion.chunk",
+                                                                "created": created,
+                                                                "model": model,
+                                                                "choices": [{
+                                                                    "index": 0,
+                                                                    "delta": {"tool_calls": tc_deltas},
+                                                                    "finish_reason": None,
+                                                                }],
+                                                            }
+                                                            await queue.put(f"data: {json.dumps(tc_chunk)}\n\n")
+                                                            saw_tool_calls = True
+                                                    
+                                                    # Update finish reason
+                                                    finish_reason = "tool_calls" if saw_tool_calls else "stop"
+                                                else:
+                                                    # Retry failed, emit error
+                                                    err_chunk = {
+                                                        "id": completion_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": created,
+                                                        "model": model,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {},
+                                                            "finish_reason": "error",
+                                                        }],
+                                                        "error": {
+                                                            "message": "Model failed to produce structured tool_calls after retry",
+                                                            "type": "tool_call_retry_failed",
+                                                            "code": "retry_failed",
+                                                        },
+                                                    }
+                                                    await queue.put(f"data: {json.dumps(err_chunk)}\n\n")
+                                                    finish_reason = "error"
+                                            else:
+                                                # No retry needed, use original finish reason
+                                                if saw_tool_calls:
+                                                    finish_reason = "tool_calls"
+                                                else:
+                                                    dr = data.get("done_reason")
+                                                    finish_reason = (
+                                                        dr if dr in ("stop", "length", "content_filter")
+                                                        else "stop"
+                                                    )
+                                        else:
+                                            # No retry condition, use original finish reason
+                                            if saw_tool_calls:
+                                                finish_reason = "tool_calls"
+                                            else:
+                                                dr = data.get("done_reason")
+                                                finish_reason = (
+                                                    dr if dr in ("stop", "length", "content_filter")
+                                                    else "stop"
+                                                )
+                                        
+                                        mark_progress("done")
+                                        usage_chunk = _build_stream_usage_chunk(
+                                            include_usage=include_stream_usage,
+                                            completion_id=completion_id,
+                                            created=created,
+                                            model=model,
+                                            done_data=data,
+                                        )
+                                        if usage_chunk is not None:
+                                            await queue.put(f"data: {json.dumps(usage_chunk)}\n\n")
+
+                                        end_chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {},
+                                                "finish_reason": finish_reason,
+                                            }],
+                                        }
+                                        await queue.put(
+                                            f"data: {json.dumps(end_chunk)}\n\n"
+                                        )
+                                        if not stream_state.get("finalized"):
+                                            await queue.put("data: [DONE]\n\n")
+                                            stream_state["finalized"] = True
+                                            logger.debug("streaming: emitted [DONE] terminator (normal completion)")
+                                        stream_state["stream_state"] = "completed"
+                                        return
+
+                                if retry_stream:
+                                    continue
+
+                                # Stream completed successfully; exit retry loop.
+                                stream_state["stream_state"] = "completed"
+                                return
                 except Exception as exc:
+                    logger.warning("streaming: exception in reader task: %s", exc, exc_info=True)
                     error_response = _safe_error_response(exc, "streaming: reader task")
+                    if stream_state["stream_state"] == "opening":
+                        stream_state["stream_state"] = "failed_before_progress"
+                    error_message = str(exc) if isinstance(exc, TimeoutError) else error_response["error"]["message"]
+                    error_type = "ollama_model_evicted" if isinstance(exc, TimeoutError) else error_response["error"]["type"]
+                    error_code = "ollama_model_evicted" if isinstance(exc, TimeoutError) else error_response["error"]["code"]
+                    if isinstance(exc, RuntimeError) and "completed without any assistant content or tool calls" in str(exc):
+                        error_message = str(exc)
+                        error_type = "empty_assistant_response"
+                        error_code = "empty_assistant_response"
                     err_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -1349,14 +2137,21 @@ async def chat_completions(request: Request):
                             "finish_reason": "error",
                         }],
                         "error": {
-                            "message": error_response["error"]["message"],
-                            "type": error_response["error"]["type"],
-                            "code": error_response["error"]["code"],
+                            "message": error_message,
+                            "type": error_type,
+                            "code": error_code,
                         },
                     }
                     await queue.put(f"data: {json.dumps(err_chunk)}\n\n")
+                    logger.debug("streaming: emitted error chunk (exception path)")
+                    if not stream_state.get("finalized"):
+                        await queue.put("data: [DONE]\n\n")
+                        stream_state["finalized"] = True
+                        logger.debug("streaming: emitted [DONE] terminator (exception path)")
                 finally:
+                    logger.debug("streaming: final stream state=%s", stream_state)
                     await queue.put(SENTINEL)
+                    logger.debug("streaming: queued sentinel")
 
             hb_task = asyncio.create_task(heartbeat())
             rd_task = asyncio.create_task(reader())
@@ -1364,6 +2159,7 @@ async def chat_completions(request: Request):
                 while True:
                     item = await queue.get()
                     if item is SENTINEL:
+                        logger.debug("streaming: downstream stream closed")
                         break
                     yield item
             finally:
@@ -1398,20 +2194,111 @@ async def chat_completions(request: Request):
     
     logger.debug("Ollama /api/chat response for non-streaming: status %d", response.status_code)
     if response.status_code >= 400:
-        error_response = _safe_error_response(
-            Exception(f"Ollama error status={response.status_code}: {response.text[:500]}"),
-            "chat_completions: Ollama upstream"
-        )
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=error_response["error"]["message"]
-        )
+        # Context overflow recovery pipeline: detect context error and retry with bounded attempts.
+        context_retry_count = 0
+        while response.status_code >= 400 and is_context_overflow_error(response.status_code, response.text):
+            if context_retry_count >= HEADROOM_RECOVERY_MAX_RETRIES:
+                break
+            context_retry_count += 1
+            logger.warning(
+                "Context overflow detected for model %s (status=%d), applying recovery trim and retrying (attempt %d/%d)",
+                model_name,
+                response.status_code,
+                context_retry_count,
+                HEADROOM_RECOVERY_MAX_RETRIES,
+            )
+            try:
+                recovery_result = apply_overflow_recovery(
+                    payload["messages"], model_name, policy_entry
+                )
+                trimmed_messages = recovery_result.messages
+                was_trimmed = recovery_result.changed
+                logger.info(
+                    "Overflow recovery nonstream model=%s stage=%s attempts=%d changed=%s success_candidate=%s",
+                    model_name,
+                    recovery_result.final_stage,
+                    len(recovery_result.attempts),
+                    recovery_result.changed,
+                    recovery_result.success_candidate,
+                )
+                if not was_trimmed:
+                    logger.warning("Overflow recovery did not reduce messages for model %s; propagating upstream error", model_name)
+                    break
+
+                logger.info("Overflow recovery applied for model %s, retrying with %d messages", model_name, len(trimmed_messages))
+                payload["messages"] = trimmed_messages
+                response = await _ollama_post("/api/chat", payload, stream=False)
+                logger.debug("Ollama /api/chat retry response for non-streaming: status %d", response.status_code)
+            except Exception as trim_exc:
+                logger.error("Overflow recovery failed for model %s: %s", model_name, trim_exc, exc_info=True)
+                break
+
+        if response.status_code >= 400:
+            error_response = _safe_error_response(
+                Exception(f"Ollama error status={response.status_code}: {response.text[:500]}"),
+                "chat_completions: Ollama upstream"
+            )
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=error_response["error"]["message"]
+            )
 
     result = response.json()
     ollama_message = result.get("message") or {}
 
+    # Check for tool-call retry condition
+    model_entry = MODEL_POLICY.get(model_name, {})
+    
+    if _should_retry_tool_call(body, model_entry):
+        content_check = ollama_message.get("content", "") or ""
+        tool_calls_check = _translate_tool_calls(ollama_message.get("tool_calls") or [])
+        
+        if not tool_calls_check:
+            # Extract tool names from request
+            tool_names = _extract_tool_names(body)
+            
+            # Check if assistant content mentions any tool
+            if _detect_tool_call_failure(content_check, tool_names, False):
+                logger.info(
+                    "router: tool-call failure detected model=%s content_mentions_tool=true",
+                    model_name,
+                )
+                
+                # Perform retry
+                retry_result = await _perform_tool_call_retry(
+                    body=body,
+                    model_name=model_name,
+                    model_entry=model_entry,
+                    original_payload=payload,
+                )
+                
+                if retry_result["success"]:
+                    result = retry_result["result"]
+                    ollama_message = result.get("message") or {}
+                else:
+                    # Retry failed, return protocol error
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": "tool_call_retry_failed",
+                            "message": "Model failed to produce structured tool_calls after retry",
+                            "retry_attempted": True,
+                            "retry_error": retry_result.get("error"),
+                        },
+                    )
+
     content = ollama_message.get("content", "") or ""
     tool_calls = _translate_tool_calls(ollama_message.get("tool_calls") or [])
+
+    if not content and not tool_calls:
+        logger.warning(
+            "Ollama returned an empty assistant response for model %s",
+            model,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama returned an empty assistant response",
+        )
 
     assistant_message = {"role": "assistant", "content": content}
     if tool_calls:

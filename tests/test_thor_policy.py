@@ -38,7 +38,7 @@ class TestThorPolicy(unittest.TestCase):
 
         # Thor profile models (from profiles/thor/models.yaml)
         coder = model_table["qwen3-coder-next:q4_K_M"]
-        self.assertEqual(coder["keep_alive"], "45m")
+        self.assertEqual(coder["keep_alive"], "30m")
         self.assertEqual(coder["think"], False)
         self.assertEqual(coder["options"]["num_ctx"], 131072)
         self.assertFalse(coder["warmup"])
@@ -49,11 +49,11 @@ class TestThorPolicy(unittest.TestCase):
         self.assertEqual(thinker["options"]["num_ctx"], 262144)
         self.assertEqual(thinker["warmup"], True)
 
-        chat_small = model_table["qwen3:4b"]
-        self.assertEqual(chat_small["keep_alive"], "30m")
-        self.assertEqual(chat_small["think"], True)
-        self.assertEqual(chat_small["options"]["num_ctx"], 40960)
-        self.assertEqual(chat_small["warmup"], False)
+        embedding = model_table["qwen3-embedding:8b"]
+        self.assertEqual(embedding["keep_alive"], -1)
+        self.assertEqual(embedding["think"], False)
+        self.assertEqual(embedding["options"]["num_ctx"], 40960)
+        self.assertEqual(embedding["warmup"], True)
 
 
 if __name__ == "__main__":

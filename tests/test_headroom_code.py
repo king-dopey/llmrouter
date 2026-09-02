@@ -29,7 +29,7 @@ class TestCodeCompressionConfig:
 
         with (
             patch_headroom_compress(compressed) as call,
-            patch_token_count(side_effect=[100, 50]),
+            patch_token_count(side_effect=[100, 50, 50]),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -54,7 +54,7 @@ class TestCodeCompressionConfig:
 
         with (
             patch_headroom_compress(compressed),
-            patch_token_count(side_effect=[200, 80]),
+            patch_token_count(side_effect=[200, 80, 80]),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -81,7 +81,7 @@ class TestCodeCompressionEdgeCases:
 
         with (
             patch_headroom_compress(compressed),
-            patch_token_count(side_effect=[10, 10]),
+            patch_token_count(side_effect=[10, 10, 10]),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -101,7 +101,7 @@ class TestCodeCompressionEdgeCases:
 
         with (
             patch_headroom_compress_dict(compressed),
-            patch_token_count(side_effect=[100, 50]),
+            patch_token_count(side_effect=[100, 50, 50]),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -138,7 +138,7 @@ class TestCodeCompressionErrorHandling:
 
         with (
             mock.patch.object(headroom, "_headroom_compress") as mock_compress,
-            patch_token_count(side_effect=[10, 5]),
+            patch_token_count(side_effect=[10, 5, 5]),
         ):
             # First call raises TypeError, second succeeds
             mock_compress.side_effect = [TypeError("old API"), compressed]
@@ -180,16 +180,16 @@ class TestCodeCompressionBudget:
     """Tests for code compression budget enforcement."""
 
     @pytest.mark.compression
-    def test_code_compression_rejects_when_exceeds_budget(self, patch_headroom_compress, patch_token_count):
-        """Test rejection when compressed prompt exceeds budget."""
+    def test_code_compression_does_not_reject_when_exceeds_budget(self, patch_headroom_compress, patch_token_count):
+        """Compaction stage never rejects; overflow is handled in recovery path."""
         compressed_messages = [{"role": "user", "content": "still too long"}]
         with (
             patch_headroom_compress(compressed_messages),
-            patch_token_count(side_effect=[900, 850]),
+            patch_token_count(side_effect=[900, 850, 850]),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
-        assert result.rejected is True
+        assert result.rejected is False
         assert result.prompt_tokens == 850
         assert result.usable_prompt_budget == 800
 
@@ -199,7 +199,7 @@ class TestCodeCompressionBudget:
         compressed_messages = [{"role": "user", "content": "short"}]
         with (
             patch_headroom_compress(compressed_messages),
-            patch_token_count(side_effect=[900, 700]),
+            patch_token_count(side_effect=[900, 700, 700]),
         ):
             result = headroom.check_and_trim(MESSAGES, MODEL, CODE_POLICY)
 
@@ -231,7 +231,7 @@ class TestCodeCompressionIntegration:
 
         with (
             patch_headroom_compress(compressed),
-            patch_token_count(side_effect=[150, 80]),
+            patch_token_count(side_effect=[150, 80, 80]),
         ):
             result = headroom.check_and_trim(
                 [

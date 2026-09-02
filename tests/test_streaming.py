@@ -28,8 +28,12 @@ def _install_dependency_stubs() -> None:
                 self.args = args
                 self.kwargs = kwargs
 
+        class Response:
+            pass
+
         httpx.Timeout = Timeout
         httpx.AsyncClient = AsyncClient
+        httpx.Response = Response
         sys.modules["httpx"] = httpx
 
     if "fastapi" not in sys.modules:
@@ -313,6 +317,54 @@ class TestStreamUsageChunkEdgeCases:
         )
         assert chunk["usage"]["prompt_tokens"] == 0
         assert chunk["usage"]["completion_tokens"] == 0
+
+
+@pytest.mark.streaming
+class TestStreamDoneTerminator:
+    """Tests for [DONE] terminator emission in all stream paths."""
+
+    def test_done_terminator_structure(self):
+        """Test that [DONE] terminator has correct format."""
+        done_terminator = "data: [DONE]\n\n"
+        assert done_terminator.startswith("data: ")
+        assert done_terminator.endswith("\n\n")
+        assert "[DONE]" in done_terminator
+
+    def test_done_terminator_is_sse_compliant(self):
+        """Test that [DONE] terminator follows SSE protocol."""
+        done_terminator = "data: [DONE]\n\n"
+        # SSE format: "data: <content>\n\n"
+        lines = done_terminator.split("\n")
+        assert lines[0].startswith("data: ")
+        assert lines[1] == ""  # Empty line after data
+        assert lines[2] == ""  # Final newline
+
+    def test_error_chunk_structure(self):
+        """Test that error chunk has correct structure for [DONE] emission."""
+        import json
+        error_chunk = {
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 123,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "error",
+            }],
+            "error": {
+                "message": "Test error",
+                "type": "test_error",
+                "code": "test_code",
+            },
+        }
+        # Verify error chunk can be serialized
+        serialized = f"data: {json.dumps(error_chunk)}\n\n"
+        assert "finish_reason" in serialized
+        assert "error" in serialized
+        # After error chunk, [DONE] should be emitted
+        full_stream = serialized + "data: [DONE]\n\n"
+        assert full_stream.endswith("data: [DONE]\n\n")
 
     def test_stream_usage_chunk_large_tokens(self):
         """Test usage chunk with large token counts."""

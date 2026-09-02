@@ -38,21 +38,21 @@ class TestOrinPolicy(unittest.TestCase):
 
         # Orin profile models (from profiles/orin/models.yaml)
         coder = model_table["qwen3-coder:30b"]
-        self.assertEqual(coder["keep_alive"], -1)
+        self.assertEqual(coder["keep_alive"], "20m")
         self.assertEqual(coder["think"], False)
         self.assertEqual(coder["options"]["num_ctx"], 65536)
-        self.assertTrue(coder["warmup"])
+        self.assertFalse(coder["warmup"])
 
         thinker = model_table["qwen3.6:35b-a3b"]
-        self.assertEqual(thinker["keep_alive"], "10m")
+        self.assertEqual(thinker["keep_alive"], -1)
         self.assertEqual(thinker["think"], True)
-        self.assertEqual(thinker["options"]["num_ctx"], 32768)
-        self.assertEqual(thinker["warmup"], False)
+        self.assertEqual(thinker["options"]["num_ctx"], 65536)
+        self.assertEqual(thinker["warmup"], True)
 
         chat_small = model_table["qwen3:4b"]
         self.assertEqual(chat_small["keep_alive"], "10m")
         self.assertEqual(chat_small["think"], True)
-        self.assertEqual(chat_small["options"]["num_ctx"], 65536)
+        self.assertEqual(chat_small["options"]["num_ctx"], 32768)
         self.assertEqual(chat_small["warmup"], False)
 
 

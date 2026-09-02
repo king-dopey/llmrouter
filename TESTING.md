@@ -12,7 +12,7 @@ Comprehensive pytest suite for the OpenAI-Compatible Router Node for Ollama LLM.
 
 ## Overview
 
-The project uses **pytest** (v7.4+) for unit testing with a comprehensive suite of **260+ tests** covering all core modules.
+The project uses **pytest** (v7.4+), with docker, for unit testing with a comprehensive suite of **336 tests** covering all core modules, including recovery ladder v2 behavior under feature flag and the three-tier think policy hierarchy.
 
 > **Note:** New tests for `_HEADROOM_CONFIG` and `_validate_tool_integrity()` are included in the `base` marker category (29 base + 16 config/validation = 45 total).
 
@@ -36,6 +36,7 @@ The audit target:
 1. Installs all dependencies from [`requirements.txt`](requirements.txt) including `headroom-ai[code]` (relevance extras removed in Story 1)
 2. Copies all test files
 3. Runs `python3 -m pytest tests/ -v`
+4. Runs explicit recovery-ladder-v2 tests with `HEADROOM_RECOVERY_LADDER_V2=1`
 
 **Note:** `docker compose build audit` will NOT work because the audit target is not defined as a service in docker-compose.yml.
 
@@ -70,6 +71,15 @@ docker run --rm llmrouter-audit python3 -m pytest tests/test_tokenizer.py -v
 
 # Run with coverage
 docker run --rm llmrouter-audit python3 -m pytest tests/ --cov=app --cov=router_headroom --cov-report=term-missing
+
+# Run recovery ladder v2 focused tests
+docker run --rm -e HEADROOM_RECOVERY_LADDER_V2=1 llmrouter-audit \
+    python3 -m pytest \
+    tests/test_headroom_base.py::TestRecoveryLadderV2::test_stage_d_respects_min_segments_to_keep \
+    tests/test_headroom_base.py::TestRecoveryLadderV2::test_strip_oldest_segments_blocks_cross_segment_tool_orphans \
+    tests/test_chat_completions_integration.py::ChatCompletionIntegrationTests::test_nonstream_context_overflow_uses_recovery_ladder_when_enabled \
+    tests/test_chat_completions_integration.py::ChatCompletionIntegrationTests::test_nonstream_context_overflow_respects_max_retries_zero \
+    -v
 ```
 
 ## Test Structure
@@ -77,21 +87,22 @@ docker run --rm llmrouter-audit python3 -m pytest tests/ --cov=app --cov=router_
 ```
 tests/
 ├── conftest.py                    # Shared fixtures for headroom compression
-├── test_headroom_base.py          # Base compression (29 tests)
+├── test_headroom_base.py          # Base compression + recovery ladder v2 tests
 ├── test_headroom_code.py          # Code compression (12 tests)
 ├── test_headroom_config_validation.py  # Config & integrity validation (16 tests)
 ├── test_headroom_integration.py   # Integration tests with real headroom (10 tests)
 ├── test_tokenizer.py              # Token counting (19 tests)
 ├── test_think_policy.py           # Think policy evaluation (35 tests)
+├── test_policy.py                 # Think policy three-tier hierarchy (11 tests)
+├── test_retry_guard.py            # Tool-call retry guard (17 tests)
 ├── test_retrieval.py              # Qdrant retrieval (15 tests)
 ├── test_embeddings.py             # Embedding generation (14 tests)
 ├── test_streaming.py              # SSE streaming (23 tests)
 ├── test_usage_tracking.py         # Usage token tracking (17 tests)
 ├── test_app.py                    # App endpoint tests (unittest, 9 tests)
-├── test_chat_completions_integration.py  # Integration tests (unittest, 5 tests)
+├── test_chat_completions_integration.py  # Integration tests including context-overflow ladder path
 ├── test_embeddings_endpoint.py    # Embeddings endpoint (unittest, 4 tests)
 ├── test_nonstream_usage.py        # Non-stream usage (unittest, 2 tests)
-├── test_policy.py                 # Think policy (unittest, 7 tests)
 ├── test_stream_usage.py           # Stream usage chunk (unittest, 2 tests)
 ```
 
@@ -129,6 +140,9 @@ Tests for the headroom-ai inline compression layer.
 - Configuration flags (HEADROOM_ENABLED only — HEADROOM_RELEVANCE_ENABLED removed in Story 1)
 - Error handling (missing dependency, TypeError fallback, general exceptions)
 - Telemetry extraction (tokens_before, tokens_after, transforms_applied)
+- Recovery ladder v2 feature-flag path (`HEADROOM_RECOVERY_LADDER_V2=1`)
+- Last-resort linear segment stripping behavior
+- Material-change guard (no-op reductions do not trigger retry)
 
 ### Config & Integrity Validation Tests (16 tests)
 
@@ -158,13 +172,69 @@ Tests for token counting with tiktoken and approximate methods.
 |--------|-------------|------|-------|
 | `tokenizer` | Token counting and estimation | `test_tokenizer.py` | 19 |
 
-### Think Policy Tests (35 tests)
+### Think Policy Tests (46 tests)
 
-Tests for the think flag injection policy based on tool names, content size, and summary requests.
+Tests for the ReAct-aligned think policy three-tier hierarchy and safety invariant.
 
 | Marker | Description | File | Count |
 |--------|-------------|------|-------|
 | `policy` | Think policy configuration | `test_think_policy.py` | 35 |
+| `policy` | Think policy three-tier hierarchy | `test_policy.py` | 11 |
+
+**Three-Tier Hierarchy Coverage:**
+
+The `test_policy.py` file comprehensively tests the three-tier rule hierarchy:
+
+**Rule 1 (Safety Invariant) Tests:**
+- `test_safety_invariant_cannot_be_overridden` - Verifies safety invariant cannot be bypassed by any override value
+- `test_model_with_tool_call_think_false_and_tools_returns_false`
+- `test_model_with_tool_call_think_false_without_tools_returns_default`
+- `test_model_with_tool_call_think_false_cannot_override_with_tool_call_true`
+- `test_model_with_tool_call_think_false_and_safe_tool_still_returns_false`
+
+**Rule 2 (Tool Request Handling) Tests:**
+- `test_invalid_override_with_tools_denied` - Verifies invalid overrides are denied (fail-safe)
+- `test_web_search_tool_disables_think`
+- `test_file_search_tool_keeps_think_enabled`
+- `test_openweather_tool_keeps_think_enabled`
+- `test_research_does_not_match_search_false_positive`
+- `test_model_with_tools_no_policy_returns_false_failsafe`
+- `test_model_with_tools_and_tool_call_true_override`
+- `test_model_with_tools_and_invalid_override_denied`
+
+**Rule 3 (Non-Tool Request Handling) Tests:**
+- `test_threshold_boundary` - Verifies char_threshold boundary conditions (at, below, above)
+- `test_empty_vs_missing_tools` - Verifies empty vs missing tools arrays behave identically
+- `test_long_content_disables_think` - Verifies char_threshold is sole determinant for non-tool requests
+- `test_override_forces_value` - Verifies override behavior without tools
+
+**Coverage Improvements:**
+
+The recent policy redesign added 4 new test cases to improve coverage of the three-tier hierarchy:
+
+1. **`test_safety_invariant_cannot_be_overridden`** - Explicitly verifies that the safety invariant (Rule 1) cannot be bypassed by any override value, including `tool_call_true`, `true`, and `false`.
+
+2. **`test_invalid_override_with_tools_denied`** - Explicitly verifies that invalid override values with tools present are denied (fail-safe to False), and only `tool_call_true` is accepted.
+
+3. **`test_threshold_boundary`** - Verifies char_threshold boundary conditions: exactly at threshold (disabled), just below (enabled), just above (disabled).
+
+4. **`test_empty_vs_missing_tools`** - Verifies that empty tools array `[]` and missing tools key are treated identically (both trigger Rule 3).
+
+These tests ensure comprehensive coverage of the ReAct-aligned policy logic and validate that the safety invariant, fail-safe behavior, and char_threshold heuristic work correctly in all scenarios.
+
+### Retry Guard Tests (17 tests)
+
+Tests for the tool-call retry guard feature that prevents infinite agent loops when models mention tools but fail to produce structured tool_calls.
+
+| Marker | Description | File | Count |
+|--------|-------------|------|-------|
+| `retry` | Tool-call retry guard | `test_retry_guard.py` | 17 |
+
+**Coverage:**
+- `_detect_tool_call_failure()` function with various input combinations
+- Retry configuration loading from models.yaml
+- Retry guard integration (disabled, no tools, temperature applied)
+- Edge cases (special characters, unicode, multiline content, similar tool names)
 
 ### Retrieval Tests (15 tests)
 
