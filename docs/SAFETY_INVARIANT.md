@@ -352,6 +352,63 @@ When adding a new model to `models.yaml`:
 - If explicitly set to `true`, remove the field or set to `false`
 - Restart router to reload configuration
 
+## Tool-Call Retry Guard
+
+In addition to the safety invariant, the router includes a **one-shot retry guard** to handle cases where models mention tools in text but fail to produce structured tool_calls.
+
+### How It Works
+
+1. **Detection**: When a model returns assistant text mentioning a tool but no structured `tool_calls`
+2. **Retry**: The router automatically retries once with `think: false` and low temperature (0.1)
+3. **Result**: Returns the retry result or a structured error if retry fails
+
+### Configuration
+
+```yaml
+# profiles/orin/models.yaml or profiles/thor/models.yaml
+- model: qwen3.6:35b-a3b
+  retry_on_tool_call_failure: true   # Enable retry guard
+  retry_temperature: 0.1              # Temperature for retry (default: 0.1)
+```
+
+### Behavior
+
+- **Opt-in**: Retry is enabled per model via `retry_on_tool_call_failure`
+- **Safety**: Forces `think: false` to prevent reasoning loops
+- **Deterministic**: Uses low temperature (configurable) for consistent output
+- **Clean**: Removes invalid assistant response before retry
+- **Error Handling**: Returns HTTP 502 with `retry_attempted: true` if retry fails
+- **Universal**: Works for both streaming and non-streaming requests
+
+### Example Error Response
+
+```json
+{
+  "error": "tool_call_retry_failed",
+  "message": "Model failed to produce structured tool_calls after retry",
+  "retry_attempted": true,
+  "retry_error": "Retry did not produce tool_calls"
+}
+```
+
+### Implementation Details
+
+The retry guard is implemented in `app.py`:
+
+- `_detect_tool_call_failure()`: Detects when assistant text mentions tools but no structured calls
+- `_perform_tool_call_retry()`: Executes the one-shot retry with forced settings
+- Integrated into both streaming and non-streaming paths in `chat_completions()`
+
+### Test Coverage
+
+17 comprehensive tests in `tests/test_retry_guard.py`:
+- Detection logic (8 tests)
+- Configuration loading (2 tests)
+- Integration behavior (3 tests)
+- Edge cases (4 tests)
+
+All Qwen models in Orin and Thor profiles have retry guard enabled by default.
+
 ## Related Documentation
 
 - [Think Control Policy](../README.md#think-control-policy-router---external-llm-backend) - Overview in README

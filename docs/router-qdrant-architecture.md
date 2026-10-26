@@ -24,7 +24,7 @@ This workspace depends on two external services:
 The router provides:
 1. **OpenAI-compatible API endpoints** (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) for client compatibility with LibreChat, Zoo Code, and other tools
 2. **Per-model policy routing** — Selects appropriate Ollama backend based on model name from `models.yaml`
-3. **Think-control policy** — Injects or suppresses the `think` flag based on tool patterns, content size, and summary heuristics
+3. **Think-control policy** — Injects or suppresses the `think` flag based on model configuration, tool presence, and content size (ReAct-aligned)
 4. **Headroom-ai context management** — Inline compression layer before forwarding to Ollama
 5. **Token counting** — Approximate and tiktoken-based token estimation
 6. **Qdrant retrieval** (optional) — Vector database integration for RAG with document ingestion
@@ -65,7 +65,7 @@ The router provides:
 | File | Purpose | Dependencies |
 |------|---------|--------------|
 | [`app.py`](../app.py) | Main FastAPI entry point with OpenAI-compatible endpoints | `policy`, `retrieval`, `router_headroom`, `tokenizer` |
-| [`policy.py`](../policy.py) | Think-control policy engine (tool patterns, summary heuristics, character threshold) | `os`, `re`, `dataclasses`, `typing` |
+| [`policy.py`](../policy.py) | Think-control policy engine (model-aware safety invariant, character threshold) | `os`, `dataclasses`, `typing` |
 | [`retrieval.py`](../retrieval.py) | Vector retrieval module using Qdrant for RAG | `qdrant_client`, `httpx`, `hashlib` |
 | [`tokenizer.py`](../tokenizer.py) | Token counting utility (approximate + tiktoken modes) | `tiktoken`, `yaml`, `json` |
 | [`router_headroom.py`](../router_headroom.py) | Headroom-ai compression adapter for context management | `headroom`, `tokenizer` |
@@ -148,8 +148,6 @@ These variables are loaded via Docker Compose `env_file` directive for the route
 | `ROUTER_BIND_IP` | `0.0.0.0` | Router bind interface (Docker Compose host-side binding) |
 | `ROUTER_PORT` | `4000` | Host-side port mapped to internal container port |
 | `KEEP_ALIVE_DEFAULT` | `-1` | Default model keep_alive duration |
-| `DISABLE_THINK_TOOL_PATTERNS` | `web_search,search,browser,browse,serp,http_get,http,fetch,scrape` | Tool patterns that disable think |
-| `DISABLE_THINK_SUMMARY_PATTERNS` | `summarize,tl;dr,tldr,bullet summary,key takeaways` | Summary patterns that disable think |
 | `DISABLE_THINK_CHAR_THRESHOLD` | `12000` | Character threshold for disabling think on large content |
 | `AUTO_PULL_MISSING_MODELS` | `true` | Automatically pull missing models during warmup |
 | `MODEL_PULL_TIMEOUT_SEC` | `7200` | Maximum time to wait for model pull (seconds) |
@@ -224,20 +222,27 @@ The router injects the `think` flag in requests to Ollama based on policy rules:
 
 ### Policy Defaults
 
+The router implements a ReAct-aligned think policy that evaluates each turn based on its own task requirements, not conversation history:
+
 - Per-model defaults come from the active profile's `models.yaml` (mounted as `/app/model_policy.yml`)
 - `qwen3-coder:30b` (Orin) and `qwen3-coder-next:q4_K_M` (Thor) default to `think=false`
 - Most general-purpose models default to `think=true`
-- `think=false` for web/browse/search-style tool flows (`web_search`, `browser`, `http_get`, `fetch`, `scrape`)
-- `think=true` for non-web tools (`file_search`, `openweather`) unless summarization/size heuristics trigger `think=false`
-- `think=false` when message content exceeds `DISABLE_THINK_CHAR_THRESHOLD` (12000 chars) or for summary-like last-user turns
+- **Rule 1**: Models with `tool_call_think: false` and tools present → `think=false` (safety invariant, no overrides)
+- **Rule 2**: Models with tools present → explicit `tool_call_think` policy or fail-safe to `false`
+- **Rule 3**: No tools present → apply character threshold heuristic, then default
+  - `think=false` when message content exceeds `DISABLE_THINK_CHAR_THRESHOLD` (12000 chars)
+  - Otherwise, use model's default `think` value from `models.yaml`
+
+**Note**: The legacy `DISABLE_THINK_TOOL_PATTERNS` and `DISABLE_THINK_SUMMARY_PATTERNS` environment variables have been removed. The policy no longer disables thinking based on tool name patterns or summary keywords in conversation history. Each turn is evaluated independently per ReAct principles.
 
 ### Manual Override Header
 
 Clients can override policy with:
-- `X-Ollama-Think: true` — Force think enabled
+- `X-Ollama-Think: true` — Force think enabled (only valid when no tools present)
 - `X-Ollama-Think: false` — Force think disabled
+- `X-Ollama-Think: tool_call_true` — Force think enabled for tool requests (only valid for models without `tool_call_think: false`)
 
-If the override header is present, it takes precedence over policy.
+If the override header is present, it takes precedence over policy (except for the safety invariant on models with `tool_call_think: false`).
 
 ---
 
@@ -266,6 +271,7 @@ The router calls `headroom.compress()` with:
 ### Policy Configuration
 
 Each model in `models.yaml` defines:
+
 - `reserved_output_tokens`: Tokens reserved for generation output (e.g., `4096`)
 - `safety_headroom_tokens`: Extra buffer for unexpected tokens (e.g., `4096`)
 - `trim_strategy`: Legacy fallback trim strategy (used only when ladder-v2 flag is disabled)

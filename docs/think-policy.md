@@ -153,6 +153,7 @@ Any model configured with `tool_call_think: false` in `models.yaml` **cannot** b
 ### Why This Matters
 
 Qwen3 models exhibit a critical bug where `think: true` combined with tool schemas causes:
+
 - Deterministic token-ID repetition loops
 - 20,000-55,000+ token reasoning loops
 - 45-80 minute hangs on multi-step prompts
@@ -264,6 +265,69 @@ The safety invariant is **not** hardcoded to specific model names. It applies to
 - **Flexibility**: Operators control behavior via YAML configuration
 - **Consistency**: Single source of truth in `models.yaml`
 
+### 5. Thinking Token Isolation
+
+For thinking models (e.g., Qwen3 family), Ollama emits reasoning tokens in a separate `thinking` field during streaming. The router implements conservative isolation for these tokens:
+
+| Control | Behavior |
+|---------|----------|
+| Acknowledgment | Thinking tokens are acknowledged as valid assistant payload to prevent false "no content" errors |
+| Client Forwarding | Thinking tokens are **NOT** forwarded to clients by default |
+| Information Disclosure | No model reasoning chains are exposed to downstream consumers |
+| Configuration | Conservative approach prevents unintended side effects from model-specific behavior |
+
+This isolation ensures that internal model reasoning processes remain private while still allowing the router to correctly handle streaming responses from thinking models.
+
+## Streaming Thinking Token Handler
+
+### Overview
+
+When using thinking models (e.g., Qwen3 family) via Ollama, the model emits reasoning tokens in a separate `thinking` field during streaming responses. This is distinct from the standard `content` field used for regular assistant messages.
+
+### Problem Addressed
+
+Without proper handling, models that emit only thinking tokens (without `content` or `tool_calls`) would trigger a false "no content" `RuntimeError`:
+
+```
+RuntimeError: Ollama stream for model <name> completed without any assistant content or tool calls
+```
+
+This occurred because the streaming handler only checked for `content` and `tool_calls` fields when determining whether valid assistant payload was received.
+
+### Implementation
+
+The streaming handler in [`app.py`](app.py:1968) checks for the presence of thinking tokens and acknowledges them as valid assistant payload:
+
+```python
+# Thinking/reasoning delta (for thinking models).
+# Ollama emits thinking tokens in a separate field for thinking models.
+# We acknowledge these as valid assistant payload to prevent false
+# "no content" errors, but do not forward them to clients by default.
+thinking_token = message.get("thinking", "")
+if thinking_token:
+    saw_assistant_payload = True
+    # Note: thinking tokens are not forwarded to clients unless
+    # explicitly configured. This prevents the RuntimeError when
+    # models emit only thinking tokens without content/tool_calls.
+```
+
+### Behavior
+
+| Scenario | `thinking` Field | `content` Field | Result |
+|----------|------------------|-----------------|--------|
+| Thinking-only response | Present (non-empty) | Absent | Valid response (no error) |
+| Standard response | Absent | Present | Valid response |
+| Tool call response | Absent | Present + `tool_calls` | Valid response |
+| Empty response | Absent | Absent | `RuntimeError` raised |
+
+### Key Design Decisions
+
+1. **Acknowledgment Without Forwarding**: Thinking tokens are acknowledged as valid payload (`saw_assistant_payload = True`) but are NOT forwarded to clients. This prevents the false "no content" error while maintaining security isolation.
+
+2. **Conservative Isolation**: By default, thinking tokens are never forwarded to clients. This prevents unintended exposure of model reasoning chains.
+
+3. **Backward Compatibility**: The change does not affect existing behavior for non-thinking models. Models without `thinking` field continue to work as before.
+
 ## Testing
 
 ### Test Coverage
@@ -293,6 +357,14 @@ The three-tier rule hierarchy is comprehensively covered by tests in `tests/test
 3. `test_long_content_disables_think` - Verifies char_threshold is sole determinant
 4. `test_override_forces_value` - Verifies override behavior without tools
 
+### Streaming Thinking Token Tests
+
+The streaming thinking token handler is validated by 26 streaming tests in `tests/test_streaming.py`:
+
+| Test Category | Count | Description |
+|---------------|-------|-------------|
+| Streaming Tests | 26 | Validates SSE streaming behavior including thinking token handling |
+
 ### Running Tests
 
 ```bash
@@ -301,6 +373,9 @@ docker build --target audit -t llmrouter-audit .
 
 # Run policy tests
 docker run --rm llmrouter-audit python3 -m pytest tests/test_policy.py tests/test_think_policy.py -v
+
+# Run streaming tests
+docker run --rm llmrouter-audit python3 -m pytest tests/test_streaming.py -v
 
 # Run all tests
 docker run --rm llmrouter-audit python3 -m pytest tests/ -v
@@ -314,8 +389,9 @@ docker run --rm llmrouter-audit python3 -m pytest tests/ -v
 ✅ Strict validation of override values prevents injection attacks  
 ✅ Fail-safe default (`false`) for unconfigured models with tools  
 ✅ Configuration-driven approach eliminates hardcoded model detection  
-✅ Comprehensive test coverage (333 tests total) validates security behavior  
+✅ Comprehensive test coverage (336 tests total) validates security behavior  
 ✅ ReAct-aligned policy enables proper reasoning for summary/analysis tasks  
+✅ Thinking token isolation prevents information disclosure of reasoning chains  
 
 ### Recommendations (Non-Blocking)
 

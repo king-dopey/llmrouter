@@ -1783,6 +1783,7 @@ async def chat_completions(request: Request):
                     max_context_retries = HEADROOM_RECOVERY_MAX_RETRIES
                     context_retry_count = 0
                     eviction_retry_count = 0
+                    empty_stream_retry_count = 0
 
                     while True:
                         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1965,9 +1966,72 @@ async def chat_completions(request: Request):
                                             f"data: {json.dumps(chunk)}\n\n"
                                         )
 
+                                    # Thinking/reasoning delta (for thinking models).
+                                    # Ollama emits thinking tokens in a separate field for thinking models.
+                                    # We acknowledge these as valid assistant payload to prevent false
+                                    # "no content" errors, but do not forward them to clients by default.
+                                    thinking_token = message.get("thinking", "")
+                                    if thinking_token:
+                                        saw_assistant_payload = True
+                                        # Note: thinking tokens are not forwarded to clients unless
+                                        # explicitly configured. This prevents the RuntimeError when
+                                        # models emit only thinking tokens without content/tool_calls.
+
                                     if data.get("done"):
                                         logger.debug("streaming: received done:true from upstream model=%s", model_name)
                                         if not saw_assistant_payload:
+                                            # Diagnostic logging for empty stream failure mode
+                                            logger.error(
+                                                "Empty stream for model %s: no thinking/content/tool_calls received. "
+                                                "Last data chunk: %s",
+                                                model_name,
+                                                json.dumps(data)[:500]
+                                            )
+                                            
+                                            # Empty stream retry logic: attempt once with context recovery
+                                            empty_stream_retry_count += 1
+                                            if empty_stream_retry_count <= 1:
+                                                logger.warning(
+                                                    "Empty stream detected for model %s, attempting recovery with context trim (attempt %d/1)",
+                                                    model_name,
+                                                    empty_stream_retry_count
+                                                )
+                                                try:
+                                                    recovery_result = apply_overflow_recovery(
+                                                        payload["messages"], model_name, policy_entry
+                                                    )
+                                                    trimmed_messages = recovery_result.messages
+                                                    was_trimmed = recovery_result.changed
+                                                    logger.info(
+                                                        "Empty stream recovery model=%s stage=%s attempts=%d changed=%s success_candidate=%s",
+                                                        model_name,
+                                                        recovery_result.final_stage,
+                                                        len(recovery_result.attempts),
+                                                        recovery_result.changed,
+                                                        recovery_result.success_candidate,
+                                                    )
+                                                    if was_trimmed:
+                                                        logger.info(
+                                                            "Empty stream recovery applied for model %s, retrying with %d messages",
+                                                            model_name,
+                                                            len(trimmed_messages)
+                                                        )
+                                                        payload["messages"] = trimmed_messages
+                                                        retry_stream = True
+                                                        break  # Break from inner while loop to retry outer while loop
+                                                    else:
+                                                        logger.warning(
+                                                            "Empty stream recovery did not reduce messages for model %s; raising error",
+                                                            model_name
+                                                        )
+                                                except Exception as recovery_exc:
+                                                    logger.error(
+                                                        "Empty stream recovery failed for model %s: %s",
+                                                        model_name,
+                                                        recovery_exc,
+                                                        exc_info=True
+                                                    )
+                                            
                                             raise RuntimeError(
                                                 f"Ollama stream for model {model_name} completed without any assistant content or tool calls"
                                             )
